@@ -71,53 +71,24 @@
 
 ## 快速开始
 
-预编译 ARM64 版本见 [Releases](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest)。适用于 Debian 11 / glibc 2.31 或更新的系统；解压后运行 `bin/open_rknpu2_lm_infer`，模型独立提供。
+在 RK3588 Linux 板上复制粘贴以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
 
-在 RK3588 Linux 板上构建（rustup 会按 `rust-toolchain.toml` 自动安装 Rust 1.95）：
-
-```sh
-sudo apt install build-essential cmake libclang-dev git
-git submodule update --init --depth 1
-cargo build --release --locked
+```bash
+sudo apt install curl jq python3-venv libgomp1 libstdc++6
+mkdir -p ~/.local/share/open_rknpu2_lm_infer && cd ~/.local/share/open_rknpu2_lm_infer
+curl -fL "$(curl -fsSL https://api.github.com/repos/happyme531/open_rknpu2_lm_infer/releases/latest | jq -r '.assets[] | select(.name | endswith("-linux-aarch64.tar.gz")) | .browser_download_url')" | tar -xz --strip-components=1
+python3 -m venv .venv && .venv/bin/pip install 'huggingface_hub[cli]>=0.34,<1'
+.venv/bin/hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot chat
 ```
 
-指定模型目录后即可使用：
-
-```sh
-export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed
-
-# 单次流式生成
-target/release/open_rknpu2_lm_infer run '你好，请介绍一下自己。' --chat-template -n 128
-# 终端聊天
-target/release/open_rknpu2_lm_infer chat
-# OpenAI 兼容服务
-target/release/open_rknpu2_lm_infer serve --port 8080
-```
+程序与模型保存在 `~/.local/share/open_rknpu2_lm_infer`。使用其他模型时，将最后两条命令中的模型名称替换为上表对应的 checkpoint。将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容服务。
 
 首次加载会自动调优 NPU 策略并缓存到 `~/.cache/open_rknpu2_lm_infer`，后续启动直接复用。
-
-服务启动后，可以直接用标准 OpenAI SDK 调用：
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
-stream = client.chat.completions.create(
-    model=client.models.list().data[0].id,
-    messages=[{"role": "user", "content": "用两句话介绍 RK3588。"}],
-    stream=True,
-    extra_body={"enable_thinking": False},
-)
-for chunk in stream:
-    if chunk.choices:
-        print(chunk.choices[0].delta.content or "", end="", flush=True)
-```
 
 完整命令、参数和测速方法见 [USAGE.md](llm_generated_docs/USAGE.md)；API 支持范围见 [API.md](llm_generated_docs/API.md)。
 
 程序默认使用 `OMP_WAIT_POLICY=PASSIVE`、`GOMP_SPINCOUNT=0`，与性能测试的 OpenMP 等待配置一致；用户显式设置的值优先。
-
-
 
 ## 架构
 
@@ -146,6 +117,50 @@ for chunk in stream:
 设计细节见 [ARCHITECTURE.md](llm_generated_docs/ARCHITECTURE.md)。
 
 ## 开发
+
+### 从源码构建
+
+在 RK3588 Linux 板上构建（rustup 会按 `rust-toolchain.toml` 自动安装 Rust 1.95）：
+
+```sh
+sudo apt install build-essential cmake libclang-dev git
+git clone --depth 1 https://github.com/happyme531/open_rknpu2_lm_infer.git
+cd open_rknpu2_lm_infer
+git submodule update --init --depth 1
+cargo build --release --locked
+```
+
+指定模型目录后即可使用：
+
+```sh
+export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+
+# 单次流式生成
+target/release/open_rknpu2_lm_infer run '你好，请介绍一下自己。' --chat-template -n 128
+# 终端聊天
+target/release/open_rknpu2_lm_infer chat
+# OpenAI 兼容服务
+target/release/open_rknpu2_lm_infer serve --port 8080
+```
+
+服务启动后，可以直接用标准 OpenAI SDK 调用：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+stream = client.chat.completions.create(
+    model=client.models.list().data[0].id,
+    messages=[{"role": "user", "content": "用两句话介绍 RK3588。"}],
+    stream=True,
+    extra_body={"enable_thinking": False},
+)
+for chunk in stream:
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+### 添加模型与验证
 
 新增模型架构时，实现 `LanguageModel` trait 并在 `model::load` 中注册。CLI、TUI 和 API 无需改动。
 
