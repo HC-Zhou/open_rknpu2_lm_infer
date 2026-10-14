@@ -1,0 +1,4 @@
+[submodule "native/rk_npu_matmul"]
+	path = native/rk_npu_matmul
+	url = https://github.com/happyme531/rknpu2_matmul_open.git
+	shallow = true

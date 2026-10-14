@@ -1,0 +1,1343 @@
+use crate::engine::{
+    Engine, GenerationEvent, GenerationHandle, GenerationRequest, GenerationResult, Prompt,
+};
+use crate::sampling::SamplingParams;
+use axum::{
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
+};
+use futures_util::stream;
+use serde_json::{Value, json};
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone)]
+struct AppState {
+    engine: Engine,
+    api_key: Option<Arc<str>>,
+}
+
+pub fn router(engine: Engine, api_key: Option<String>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/completions", post(completions))
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint", None) })
+        .with_state(AppState {
+            engine,
+            api_key: api_key.map(Arc::from),
+        })
+}
+
+pub async fn serve(
+    engine: Engine,
+    host: &str,
+    port: u16,
+    api_key: Option<String>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    eprintln!("OpenAI API listening on http://{}", listener.local_addr()?);
+    let shutdown_engine = engine.clone();
+    axum::serve(listener, router(engine, api_key))
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_engine.shutdown();
+        })
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+    param: Option<String>,
+}
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>, param: Option<&str>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            param: param.map(str::to_owned),
+        }
+    }
+    fn invalid(message: impl Into<String>, param: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message, Some(param))
+    }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let kind = match self.status {
+            StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => "server_error",
+            s if s.is_server_error() => "server_error",
+            _ => "invalid_request_error",
+        };
+        (self.status, Json(json!({"error":{"message":self.message,"type":kind,"param":self.param,"code":null}}))).into_response()
+    }
+}
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if let Some(key) = &state.api_key
+        && headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            != Some(key.as_ref())
+    {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid API key",
+            None,
+        ));
+    }
+    Ok(())
+}
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"status":"ok","model":state.engine.info().id}))
+}
+async fn models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers)?;
+    Ok(Json(
+        json!({"object":"list","data":[{"id":state.engine.info().id,"object":"model","created":0,"owned_by":"local"}]}),
+    ))
+}
+async fn chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    respond(state, headers, body, true).await
+}
+async fn completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    respond(state, headers, body, false).await
+}
+
+struct ParsedRequest {
+    request: GenerationRequest,
+    stream: bool,
+    include_usage: bool,
+    tools_enabled: bool,
+}
+fn function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+fn parse_tools(v: &Value, chat: bool) -> Result<Option<Value>, ApiError> {
+    let tools = match v.get("tools").filter(|x| !x.is_null()) {
+        None => None,
+        Some(x) => {
+            if !chat {
+                return Err(ApiError::invalid("tools require chat completions", "tools"));
+            }
+            let array = x
+                .as_array()
+                .ok_or_else(|| ApiError::invalid("tools must be an array", "tools"))?;
+            for tool in array {
+                if tool["type"] != "function" || !tool["function"].is_object() {
+                    return Err(ApiError::invalid(
+                        "each tool must have type=function and a function object",
+                        "tools",
+                    ));
+                }
+                let function = &tool["function"];
+                if !function["name"].as_str().is_some_and(function_name) {
+                    return Err(ApiError::invalid(
+                        "function name must contain 1..64 letters, digits, underscores or hyphens",
+                        "tools",
+                    ));
+                }
+                if function.get("parameters").is_some_and(|x| !x.is_object()) {
+                    return Err(ApiError::invalid(
+                        "function parameters must be a JSON Schema object",
+                        "tools",
+                    ));
+                }
+                if function
+                    .get("description")
+                    .is_some_and(|x| !x.is_null() && !x.is_string())
+                {
+                    return Err(ApiError::invalid(
+                        "function description must be a string",
+                        "tools",
+                    ));
+                }
+                if function
+                    .get("strict")
+                    .is_some_and(|x| !x.is_null() && x.as_bool() != Some(false))
+                {
+                    return Err(ApiError::invalid(
+                        "strict tool schemas are not supported",
+                        "tools",
+                    ));
+                }
+            }
+            if array.is_empty() {
+                None
+            } else {
+                Some(x.clone())
+            }
+        }
+    };
+    match v.get("tool_choice").filter(|x| !x.is_null()) {
+        None => Ok(tools),
+        Some(x) if x.as_str() == Some("auto") => Ok(tools),
+        Some(x) if x.as_str() == Some("none") => Ok(None),
+        _ => Err(ApiError::invalid(
+            "supported tool_choice values are auto and none",
+            "tool_choice",
+        )),
+    }
+}
+fn normalize_messages(messages: &[Value]) -> Result<Vec<Value>, ApiError> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    for message in messages {
+        let role = message["role"]
+            .as_str()
+            .ok_or_else(|| ApiError::invalid("every message needs a role", "messages"))?;
+        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            return Err(ApiError::invalid(
+                "supported roles are system, developer, user, assistant and tool",
+                "messages",
+            ));
+        }
+        let role = if role == "developer" { "system" } else { role };
+        if message.get("function_call").is_some_and(|x| !x.is_null()) {
+            return Err(ApiError::invalid(
+                "legacy function_call is not supported",
+                "messages",
+            ));
+        }
+        let mut calls = vec![];
+        if let Some(value) = message.get("tool_calls").filter(|x| !x.is_null()) {
+            if role != "assistant" {
+                return Err(ApiError::invalid(
+                    "tool_calls require an assistant message",
+                    "messages",
+                ));
+            }
+            let array = value
+                .as_array()
+                .ok_or_else(|| ApiError::invalid("tool_calls must be an array", "messages"))?;
+            for call in array {
+                let id = call["id"]
+                    .as_str()
+                    .filter(|x| !x.is_empty())
+                    .ok_or_else(|| ApiError::invalid("tool call id is required", "messages"))?;
+                if call["type"] != "function"
+                    || !call["function"]["name"].as_str().is_some_and(function_name)
+                {
+                    return Err(ApiError::invalid("invalid function tool call", "messages"));
+                }
+                let arguments = match &call["function"]["arguments"] {
+                    Value::String(s) => serde_json::from_str::<Value>(s).map_err(|_| {
+                        ApiError::invalid("tool arguments must contain valid JSON", "messages")
+                    })?,
+                    x => x.clone(),
+                };
+                if !arguments.is_object() {
+                    return Err(ApiError::invalid(
+                        "tool arguments must be a JSON object",
+                        "messages",
+                    ));
+                }
+                calls.push(json!({"id":id,"type":"function","function":{"name":call["function"]["name"],"arguments":arguments}}));
+            }
+        }
+        let content = match message.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => {
+                let mut text = String::new();
+                for part in parts {
+                    if part["type"] != "text" {
+                        return Err(ApiError::invalid(
+                            "only text message content is supported",
+                            "messages",
+                        ));
+                    }
+                    text.push_str(
+                        part["text"]
+                            .as_str()
+                            .ok_or_else(|| ApiError::invalid("text parts need text", "messages"))?,
+                    );
+                }
+                text
+            }
+            None | Some(Value::Null) if role == "assistant" && !calls.is_empty() => String::new(),
+            _ => {
+                return Err(ApiError::invalid(
+                    "message content must be text",
+                    "messages",
+                ));
+            }
+        };
+        let mut result = json!({"role":role,"content":content});
+        if role == "assistant"
+            && let Some(reasoning) = message.get("reasoning_content").filter(|x| !x.is_null())
+        {
+            if !reasoning.is_string() {
+                return Err(ApiError::invalid(
+                    "reasoning_content must be a string",
+                    "messages",
+                ));
+            }
+            result["reasoning_content"] = reasoning.clone();
+        }
+        if !calls.is_empty() {
+            result["tool_calls"] = json!(calls);
+        }
+        if role == "tool" {
+            let id = message["tool_call_id"]
+                .as_str()
+                .filter(|x| !x.is_empty())
+                .ok_or_else(|| ApiError::invalid("tool messages need tool_call_id", "messages"))?;
+            result["tool_call_id"] = json!(id);
+        }
+        normalized.push(result);
+    }
+    Ok(normalized)
+}
+fn boolean(v: &Value, name: &str, default: bool) -> Result<bool, ApiError> {
+    match v.get(name) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        _ => Err(ApiError::invalid("expected a boolean", name)),
+    }
+}
+fn number(
+    v: &Value,
+    name: &str,
+    default: f32,
+    minimum: f32,
+    maximum: f32,
+) -> Result<f32, ApiError> {
+    let n = match v.get(name) {
+        None | Some(Value::Null) => return Ok(default),
+        Some(n) => n
+            .as_f64()
+            .ok_or_else(|| ApiError::invalid("expected a number", name))?,
+    };
+    if !n.is_finite() || n < minimum as f64 || n > maximum as f64 {
+        return Err(ApiError::invalid(
+            format!("must be between {minimum} and {maximum}"),
+            name,
+        ));
+    }
+    Ok(n as f32)
+}
+fn integer(v: &Value, name: &str, default: usize, minimum: usize) -> Result<usize, ApiError> {
+    match v.get(name) {
+        None | Some(Value::Null) => Ok(default),
+        Some(n) => n
+            .as_u64()
+            .and_then(|x| usize::try_from(x).ok())
+            .filter(|x| *x >= minimum)
+            .ok_or_else(|| ApiError::invalid(format!("expected an integer >= {minimum}"), name)),
+    }
+}
+fn unsupported(
+    v: &Value,
+    name: &str,
+    harmless: impl FnOnce(&Value) -> bool,
+) -> Result<(), ApiError> {
+    if let Some(value) = v.get(name).filter(|v| !v.is_null())
+        && !harmless(value)
+    {
+        return Err(ApiError::invalid(format!("{name} is not supported"), name));
+    }
+    Ok(())
+}
+fn parse_request(
+    v: Value,
+    chat: bool,
+    model: &str,
+    context: usize,
+) -> Result<ParsedRequest, ApiError> {
+    if !v.is_object() {
+        return Err(ApiError::invalid("expected a JSON object", "body"));
+    }
+    match v.get("model").and_then(Value::as_str) {
+        Some(id) if id == model => (),
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "model not found",
+                Some("model"),
+            ));
+        }
+        None => return Err(ApiError::invalid("model is required", "model")),
+    }
+    unsupported(&v, "n", |x| x.as_u64() == Some(1))?;
+    unsupported(&v, "best_of", |x| x.as_u64() == Some(1))?;
+    unsupported(&v, "echo", |x| x.as_bool() == Some(false))?;
+    unsupported(&v, "logprobs", |x| x.as_bool() == Some(false))?;
+    unsupported(&v, "top_logprobs", |x| x.as_u64() == Some(0))?;
+    unsupported(&v, "logit_bias", |x| {
+        x.as_object().is_some_and(|x| x.is_empty())
+    })?;
+    unsupported(&v, "response_format", |x| {
+        x.as_object()
+            .is_some_and(|x| x.len() == 1 && x.get("type").and_then(Value::as_str) == Some("text"))
+    })?;
+    unsupported(&v, "functions", |x| {
+        x.as_array().is_some_and(|x| x.is_empty())
+    })?;
+    unsupported(&v, "function_call", |x| x.as_str() == Some("none"))?;
+    let tools = parse_tools(&v, chat)?;
+    let tools_enabled = tools.is_some();
+    for name in [
+        "suffix",
+        "prediction",
+        "audio",
+        "grammar",
+        "guided_json",
+        "guided_regex",
+        "allowed_token_ids",
+        "reasoning_effort",
+        "reasoning_format",
+        "verbosity",
+        "stop_token_ids",
+        "prompt_logprobs",
+        "add_generation_prompt",
+        "continue_final_message",
+    ] {
+        unsupported(&v, name, |_| false)?;
+    }
+    unsupported(&v, "modalities", |x| {
+        x.as_array().is_some_and(|x| x.len() == 1 && x[0] == "text")
+    })?;
+    unsupported(&v, "parallel_tool_calls", |x| {
+        x.as_bool() == Some(true) || (!tools_enabled && x.as_bool() == Some(false))
+    })?;
+    unsupported(&v, "ignore_eos", |x| x.as_bool() == Some(false))?;
+    unsupported(&v, "min_tokens", |x| x.as_u64() == Some(0))?;
+    let defaults = SamplingParams::default();
+    let sampling = SamplingParams {
+        temperature: number(&v, "temperature", defaults.temperature, 0.0, 2.0)?,
+        top_p: number(&v, "top_p", defaults.top_p, 0.0, 1.0)?,
+        top_k: integer(&v, "top_k", defaults.top_k, 0)?,
+        min_p: number(&v, "min_p", defaults.min_p, 0.0, 1.0)?,
+        seed: match v.get("seed") {
+            None | Some(Value::Null) => None,
+            Some(x) => Some(
+                x.as_u64()
+                    .or_else(|| x.as_i64().map(|seed| seed as u64))
+                    .ok_or_else(|| ApiError::invalid("seed must be an integer", "seed"))?,
+            ),
+        },
+        repeat_penalty: number(
+            &v,
+            "repeat_penalty",
+            defaults.repeat_penalty,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+        )?,
+        presence_penalty: number(&v, "presence_penalty", defaults.presence_penalty, -2.0, 2.0)?,
+        frequency_penalty: number(
+            &v,
+            "frequency_penalty",
+            defaults.frequency_penalty,
+            -2.0,
+            2.0,
+        )?,
+    };
+    if v.get("max_tokens").is_some_and(|x| !x.is_null())
+        && v.get("max_completion_tokens").is_some_and(|x| !x.is_null())
+        && v["max_tokens"] != v["max_completion_tokens"]
+    {
+        return Err(ApiError::invalid(
+            "max_tokens and max_completion_tokens disagree",
+            "max_completion_tokens",
+        ));
+    }
+    let max_tokens = if v.get("max_completion_tokens").is_some_and(|x| !x.is_null()) {
+        integer(&v, "max_completion_tokens", 256, 1)?
+    } else {
+        integer(&v, "max_tokens", 256, 1)?
+    };
+    if max_tokens > context {
+        return Err(ApiError::invalid(
+            "maximum output length exceeds model context",
+            "max_tokens",
+        ));
+    }
+    let stop = match v.get("stop") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(a))
+            if a.len() <= 4 && a.iter().all(|x| x.as_str().is_some_and(|s| !s.is_empty())) =>
+        {
+            a.iter().map(|x| x.as_str().unwrap().to_owned()).collect()
+        }
+        _ => {
+            return Err(ApiError::invalid(
+                "stop must be a nonempty string or up to four nonempty strings",
+                "stop",
+            ));
+        }
+    };
+    let prompt = if chat {
+        let messages = v
+            .get("messages")
+            .and_then(Value::as_array)
+            .filter(|x| !x.is_empty())
+            .ok_or_else(|| ApiError::invalid("messages must be a nonempty array", "messages"))?;
+        let normalized = normalize_messages(messages)?;
+        let mut thinking = boolean(&v, "enable_thinking", true)?;
+        if let Some(kwargs) = v.get("chat_template_kwargs").filter(|x| !x.is_null()) {
+            let kwargs = kwargs
+                .as_object()
+                .ok_or_else(|| ApiError::invalid("expected an object", "chat_template_kwargs"))?;
+            if kwargs.keys().any(|x| x != "enable_thinking") {
+                return Err(ApiError::invalid(
+                    "unsupported chat template option",
+                    "chat_template_kwargs",
+                ));
+            }
+            if let Some(x) = kwargs.get("enable_thinking") {
+                thinking = x.as_bool().ok_or_else(|| {
+                    ApiError::invalid("enable_thinking must be a boolean", "chat_template_kwargs")
+                })?;
+            }
+        }
+        Prompt::Chat {
+            messages: normalized,
+            tools,
+            enable_thinking: thinking,
+        }
+    } else {
+        match v.get("prompt") {
+            Some(Value::String(s)) => Prompt::Text(s.clone()),
+            Some(Value::Array(a))
+                if !a.is_empty()
+                    && a.iter()
+                        .all(|x| x.as_u64().is_some_and(|n| n <= u32::MAX as u64)) =>
+            {
+                Prompt::Tokens(a.iter().map(|x| x.as_u64().unwrap() as u32).collect())
+            }
+            _ => {
+                return Err(ApiError::invalid(
+                    "prompt must be a string or a nonempty token ID array; batching is not supported",
+                    "prompt",
+                ));
+            }
+        }
+    };
+    let stream = boolean(&v, "stream", false)?;
+    let include_usage = match v.get("stream_options").filter(|x| !x.is_null()) {
+        None => false,
+        Some(x) => {
+            if !stream {
+                return Err(ApiError::invalid(
+                    "stream_options requires stream=true",
+                    "stream_options",
+                ));
+            }
+            let map = x
+                .as_object()
+                .ok_or_else(|| ApiError::invalid("expected an object", "stream_options"))?;
+            if map.keys().any(|x| x != "include_usage") {
+                return Err(ApiError::invalid(
+                    "unsupported stream option",
+                    "stream_options",
+                ));
+            }
+            boolean(x, "include_usage", false)?
+        }
+    };
+    Ok(ParsedRequest {
+        request: GenerationRequest {
+            prompt,
+            sampling,
+            max_tokens,
+            stop,
+        },
+        stream,
+        include_usage,
+        tools_enabled,
+    })
+}
+
+fn usage(result: &GenerationResult) -> Value {
+    json!({"prompt_tokens":result.prompt_tokens,"completion_tokens":result.completion_tokens,"total_tokens":result.prompt_tokens + result.completion_tokens,"prompt_tokens_details":{"cached_tokens":result.cached_tokens}})
+}
+fn created() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+fn response_id(chat: bool) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{}-{}-{}",
+        if chat { "chatcmpl" } else { "cmpl" },
+        created(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+fn generation_error(error: anyhow::Error) -> ApiError {
+    let busy = error.downcast_ref::<crate::engine::EngineBusy>().is_some();
+    let text = error.to_string();
+    let status = if busy {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    ApiError::new(status, text, None)
+}
+async fn respond(
+    state: AppState,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+    chat: bool,
+) -> Result<Response, ApiError> {
+    authenticate(&state, &headers)?;
+    let Json(body) =
+        body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text(), None))?;
+    let parsed = parse_request(
+        body,
+        chat,
+        &state.engine.info().id,
+        state.engine.info().context,
+    )?;
+    let preopened_thinking = chat
+        && state
+            .engine
+            .prompt_opens_thinking(&parsed.request.prompt)
+            .map_err(generation_error)?;
+    let mut handle = state
+        .engine
+        .generate(parsed.request)
+        .map_err(generation_error)?;
+    let id = response_id(chat);
+    let timestamp = created();
+    let model = state.engine.info().id.clone();
+    if parsed.stream {
+        return Ok(stream_response(
+            handle,
+            id,
+            timestamp,
+            model,
+            chat,
+            parsed.include_usage,
+            parsed.tools_enabled,
+            preopened_thinking,
+        ));
+    }
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            GenerationEvent::Token(_) => (),
+            GenerationEvent::Error(message) => {
+                return Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    message,
+                    None,
+                ));
+            }
+            GenerationEvent::Finished(result) => {
+                let choice = if chat {
+                    chat_choice(&result, &id, parsed.tools_enabled, preopened_thinking)
+                } else {
+                    json!({"index":0,"text":result.text,"logprobs":null,"finish_reason":result.finish_reason})
+                };
+                return Ok(Json(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":timestamp,"model":model,"choices":[choice],"usage":usage(&result)})).into_response());
+            }
+        }
+    }
+    Err(ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "generation ended without a result",
+        None,
+    ))
+}
+fn split_thinking(text: &str, preopened: bool) -> (&str, Option<&str>) {
+    if let Some(rest) = text
+        .strip_prefix("<think>")
+        .or_else(|| preopened.then_some(text))
+    {
+        if let Some((reasoning, content)) = rest.split_once("</think>") {
+            return (content, Some(reasoning));
+        }
+        return ("", Some(rest));
+    }
+    (text, None)
+}
+const TOOL_OPEN: &str = "<tool_call>";
+const TOOL_CLOSE: &str = "</tool_call>";
+fn parse_tool_block(payload: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let name = value["name"].as_str().filter(|name| function_name(name))?;
+    let arguments = match &value["arguments"] {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
+        x => x.clone(),
+    };
+    if !arguments.is_object() {
+        return None;
+    }
+    Some(json!({"name":name,"arguments":serde_json::to_string(&arguments).ok()?}))
+}
+struct ToolStream {
+    enabled: bool,
+    pending: String,
+    calls: usize,
+    response_id: String,
+}
+impl ToolStream {
+    fn new(enabled: bool, response_id: String) -> Self {
+        Self {
+            enabled,
+            pending: String::new(),
+            calls: 0,
+            response_id,
+        }
+    }
+    fn push(&mut self, text: &str, flush: bool) -> Vec<Value> {
+        if !self.enabled {
+            return if text.is_empty() {
+                vec![]
+            } else {
+                vec![json!({"content":text})]
+            };
+        }
+        self.pending.push_str(text);
+        let mut out = vec![];
+        loop {
+            if let Some(start) = self.pending.find(TOOL_OPEN) {
+                if start > 0 {
+                    out.push(json!({"content":self.pending[..start]}));
+                    self.pending.drain(..start);
+                }
+                if let Some(end) = self.pending[TOOL_OPEN.len()..].find(TOOL_CLOSE) {
+                    let end = end + TOOL_OPEN.len();
+                    let consumed = end + TOOL_CLOSE.len();
+                    if let Some(function) = parse_tool_block(&self.pending[TOOL_OPEN.len()..end]) {
+                        out.push(json!({"tool_calls":[{"index":self.calls,"id":format!("{}_call_{}",self.response_id,self.calls),"type":"function","function":function}]}));
+                        self.calls += 1;
+                    } else {
+                        out.push(json!({"content":self.pending[..consumed]}));
+                    }
+                    self.pending.drain(..consumed);
+                    continue;
+                }
+                if flush {
+                    out.push(json!({"content":std::mem::take(&mut self.pending)}));
+                }
+                return out;
+            }
+            let hold = if flush {
+                0
+            } else {
+                (1..TOOL_OPEN.len().min(self.pending.len() + 1))
+                    .rev()
+                    .find(|n| {
+                        self.pending.is_char_boundary(self.pending.len() - n)
+                            && TOOL_OPEN.starts_with(&self.pending[self.pending.len() - n..])
+                    })
+                    .unwrap_or(0)
+            };
+            let end = self.pending.len() - hold;
+            if end > 0 {
+                out.push(json!({"content":self.pending[..end]}));
+                self.pending.drain(..end);
+            }
+            return out;
+        }
+    }
+}
+fn chat_choice(
+    result: &GenerationResult,
+    id: &str,
+    tools_enabled: bool,
+    preopened_thinking: bool,
+) -> Value {
+    let (text, reasoning) = split_thinking(&result.text, preopened_thinking);
+    let mut parser = ToolStream::new(tools_enabled, id.to_owned());
+    let mut content = String::new();
+    let mut calls = vec![];
+    for delta in parser.push(text, true) {
+        if let Some(text) = delta["content"].as_str() {
+            content.push_str(text);
+        }
+        if let Some(tools) = delta["tool_calls"].as_array() {
+            for call in tools {
+                let mut call = call.clone();
+                call.as_object_mut().unwrap().remove("index");
+                calls.push(call);
+            }
+        }
+    }
+    let mut message = json!({"role":"assistant","content":content});
+    if let Some(reasoning) = reasoning {
+        message["reasoning_content"] = json!(reasoning);
+    }
+    let finish_reason = if calls.is_empty() {
+        result.finish_reason.as_str()
+    } else {
+        if content.trim().is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = json!(calls);
+        "tool_calls"
+    };
+    json!({"index":0,"message":message,"finish_reason":finish_reason})
+}
+
+#[derive(Default)]
+struct ThinkingStream {
+    pending: String,
+    mode: u8,
+}
+impl ThinkingStream {
+    fn push(&mut self, text: &str, flush: bool) -> Vec<Value> {
+        self.pending.push_str(text);
+        if self.mode == 0 {
+            if self.pending.starts_with("<think>") {
+                self.pending.drain(..7);
+                self.mode = 1;
+            } else if !flush && "<think>".starts_with(&self.pending) {
+                return vec![];
+            } else {
+                self.mode = 2;
+            }
+        }
+        let mut out = vec![];
+        if self.mode == 1 {
+            if let Some(end) = self.pending.find("</think>") {
+                if end > 0 {
+                    out.push(json!({"reasoning_content":self.pending[..end]}));
+                }
+                self.pending.drain(..end + 8);
+                self.mode = 2;
+            } else {
+                let hold = if flush {
+                    0
+                } else {
+                    (1..=8.min(self.pending.len()))
+                        .rev()
+                        .find(|n| {
+                            self.pending.is_char_boundary(self.pending.len() - n)
+                                && "</think>".starts_with(&self.pending[self.pending.len() - n..])
+                        })
+                        .unwrap_or(0)
+                };
+                let end = self.pending.len() - hold;
+                if end > 0 {
+                    out.push(json!({"reasoning_content":self.pending[..end]}));
+                    self.pending.drain(..end);
+                }
+                return out;
+            }
+        }
+        if !self.pending.is_empty() {
+            out.push(json!({"content":std::mem::take(&mut self.pending)}));
+        }
+        out
+    }
+}
+struct StreamState {
+    handle: GenerationHandle,
+    id: String,
+    created: u64,
+    model: String,
+    chat: bool,
+    include_usage: bool,
+    started: bool,
+    done: bool,
+    pending: std::collections::VecDeque<Event>,
+    thinking: ThinkingStream,
+    tools: ToolStream,
+}
+impl StreamState {
+    fn chat_delta(&mut self, delta: Value) {
+        if let Some(content) = delta["content"].as_str() {
+            for tool_delta in self.tools.push(content, false) {
+                self.pending.push_back(self.chunk(tool_delta, Value::Null));
+            }
+        } else {
+            self.pending.push_back(self.chunk(delta, Value::Null));
+        }
+    }
+    fn chunk(&self, delta: Value, finish: Value) -> Event {
+        let choice = if self.chat {
+            json!({"index":0,"delta":delta,"finish_reason":finish})
+        } else {
+            json!({"index":0,"text":delta.as_str().unwrap_or(""),"logprobs":null,"finish_reason":finish})
+        };
+        let mut chunk = json!({"id":self.id,"object":if self.chat {"chat.completion.chunk"} else {"text_completion"},"created":self.created,"model":self.model,"choices":[choice]});
+        if self.include_usage {
+            chunk["usage"] = Value::Null;
+        }
+        Event::default().data(chunk.to_string())
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn stream_response(
+    handle: GenerationHandle,
+    id: String,
+    created: u64,
+    model: String,
+    chat: bool,
+    include_usage: bool,
+    tools_enabled: bool,
+    preopened_thinking: bool,
+) -> Response {
+    let tools = ToolStream::new(tools_enabled, id.clone());
+    let state = StreamState {
+        handle,
+        id,
+        created,
+        model,
+        chat,
+        include_usage,
+        started: false,
+        done: false,
+        pending: Default::default(),
+        thinking: ThinkingStream {
+            mode: u8::from(preopened_thinking),
+            ..Default::default()
+        },
+        tools,
+    };
+    let events = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                return Some((Ok::<_, Infallible>(event), state));
+            }
+            if state.done {
+                return None;
+            }
+            if !state.started {
+                state.started = true;
+                if state.chat {
+                    let event = state.chunk(json!({"role":"assistant","content":""}), Value::Null);
+                    return Some((Ok(event), state));
+                }
+            }
+            match state.handle.events.recv().await {
+                Some(GenerationEvent::Token(text)) => {
+                    if state.chat {
+                        for delta in state.thinking.push(&text, false) {
+                            state.chat_delta(delta);
+                        }
+                    } else {
+                        state
+                            .pending
+                            .push_back(state.chunk(json!(text), Value::Null));
+                    }
+                }
+                Some(GenerationEvent::Finished(result)) => {
+                    if state.chat {
+                        for delta in state.thinking.push("", true) {
+                            state.chat_delta(delta);
+                        }
+                        for delta in state.tools.push("", true) {
+                            state.pending.push_back(state.chunk(delta, Value::Null));
+                        }
+                    }
+                    state.pending.push_back(state.chunk(
+                        if state.chat { json!({}) } else { json!("") },
+                        json!(if state.tools.calls > 0 {
+                            "tool_calls"
+                        } else {
+                            result.finish_reason.as_str()
+                        }),
+                    ));
+                    if state.include_usage {
+                        state.pending.push_back(Event::default().data(json!({"id":state.id,"object":if state.chat {"chat.completion.chunk"} else {"text_completion"},"created":state.created,"model":state.model,"choices":[],"usage":usage(&result)}).to_string()));
+                    }
+                    state.pending.push_back(Event::default().data("[DONE]"));
+                    state.done = true;
+                }
+                event => {
+                    let message = match event {
+                        Some(GenerationEvent::Error(message)) => message,
+                        _ => "generation ended without a result".to_owned(),
+                    };
+                    state.pending.push_back(Event::default().data(json!({"error":{"message":message,"type":"server_error","param":null,"code":null}}).to_string()));
+                    state.pending.push_back(Event::default().data("[DONE]"));
+                    state.done = true;
+                }
+            }
+        }
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request() -> Value {
+        json!({"model":"qwen","messages":[{"role":"user","content":"hi"}]})
+    }
+    #[test]
+    fn rejects_semantic_options() {
+        for (key, value) in [
+            ("n", json!(2)),
+            ("response_format", json!({"type":"json_object"})),
+            ("tools", json!([{"type":"function"}])),
+            ("logprobs", json!(true)),
+            ("seed", json!(-0.5)),
+            ("max_tokens", json!(0)),
+        ] {
+            let mut v = request();
+            v[key] = value;
+            assert!(
+                parse_request(v, true, "qwen", 4096).is_err(),
+                "accepted {key}"
+            );
+        }
+    }
+    #[test]
+    fn developer_role_and_signed_seed_are_accepted() {
+        let request = json!({"model":"qwen","messages":[{"role":"developer","content":"be concise"},{"role":"user","content":"hi"}],"seed":-1,"top_p":0.0});
+        let parsed = parse_request(request, true, "qwen", 4096).unwrap();
+        assert_eq!(parsed.request.sampling.seed, Some(u64::MAX));
+        parsed.request.sampling.validate().unwrap();
+        match parsed.request.prompt {
+            Prompt::Chat { messages, .. } => assert_eq!(messages[0]["role"], "system"),
+            _ => panic!("expected chat prompt"),
+        }
+    }
+    #[test]
+    fn rejects_images_and_batched_prompts() {
+        let mut v = request();
+        v["messages"][0]["content"] = json!([{"type":"image_url","image_url":{"url":"x"}}]);
+        assert!(parse_request(v, true, "qwen", 4096).is_err());
+        assert!(
+            parse_request(
+                json!({"model":"qwen","prompt":["one","two"]}),
+                false,
+                "qwen",
+                4096
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn carries_sampling_stop_and_text_parts() {
+        let mut v = request();
+        v["messages"][0]["content"] =
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]);
+        v["stop"] = json!(["END"]);
+        v["seed"] = json!(42);
+        v["temperature"] = json!(0);
+        let parsed = parse_request(v, true, "qwen", 4096).unwrap();
+        assert_eq!(parsed.request.stop, vec!["END"]);
+        assert_eq!(parsed.request.sampling.seed, Some(42));
+        match parsed.request.prompt {
+            Prompt::Chat { messages, .. } => assert_eq!(messages[0]["content"], "ab"),
+            _ => panic!("expected chat"),
+        }
+    }
+    #[test]
+    fn thinking_markers_can_span_tokens() {
+        let mut stream = ThinkingStream::default();
+        let mut out = vec![];
+        for token in ["<th", "ink>abc</th", "ink>answer"] {
+            out.extend(stream.push(token, false));
+        }
+        out.extend(stream.push("", true));
+        assert_eq!(
+            out,
+            vec![
+                json!({"reasoning_content":"abc"}),
+                json!({"content":"answer"})
+            ]
+        );
+    }
+    #[test]
+    fn rejects_usage_without_stream() {
+        let mut v = request();
+        v["stream_options"] = json!({"include_usage":true});
+        assert!(parse_request(v, true, "qwen", 4096).is_err());
+    }
+    #[test]
+    fn tools_and_history_are_normalized_for_template() {
+        let mut v = request();
+        v["tools"] = json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]);
+        v["tool_choice"] = json!("auto");
+        v["messages"] = json!([
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Beijing\"}"}}]},
+            {"role":"tool","tool_call_id":"call_0","content":"sunny"}
+        ]);
+        let parsed = parse_request(v.clone(), true, "qwen", 4096).unwrap();
+        assert!(parsed.tools_enabled);
+        match parsed.request.prompt {
+            Prompt::Chat {
+                messages, tools, ..
+            } => {
+                assert!(tools.is_some());
+                assert_eq!(
+                    messages[1]["tool_calls"][0]["function"]["arguments"]["city"],
+                    "Beijing"
+                );
+                assert_eq!(messages[2]["tool_call_id"], "call_0");
+            }
+            _ => panic!("expected chat"),
+        }
+        v["tool_choice"] = json!("none");
+        assert!(
+            !parse_request(v.clone(), true, "qwen", 4096)
+                .unwrap()
+                .tools_enabled
+        );
+        v["tool_choice"] = json!("required");
+        assert!(parse_request(v, true, "qwen", 4096).is_err());
+    }
+    #[test]
+    fn complete_tools_parse_but_malformed_and_truncated_stay_text() {
+        let valid =
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"北京\"}}</tool_call>";
+        let malformed = "<tool_call>{\"name\":\"weather\",\"arguments\":bad}</tool_call>";
+        let truncated = "<tool_call>{\"name\":\"weather\"";
+        let result = GenerationResult {
+            text: format!("<think>reason</think>{valid}{malformed}{truncated}"),
+            finish_reason: "length".into(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            cached_tokens: 0,
+            timings: Value::Null,
+            stats: Value::Null,
+        };
+        let choice = chat_choice(&result, "test", true, false);
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            choice["message"]["content"],
+            format!("{malformed}{truncated}")
+        );
+        assert_eq!(choice["message"]["reasoning_content"], "reason");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"北京\"}"
+        );
+        let plain = chat_choice(&result, "test", false, false);
+        assert_eq!(plain["finish_reason"], "length");
+        assert!(plain["message"].get("tool_calls").is_none());
+    }
+    #[test]
+    fn tool_opening_and_json_can_span_every_token_boundary() {
+        let input = "prefix<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>suffix";
+        let mut parser = ToolStream::new(true, "test".into());
+        let mut deltas = vec![];
+        for character in input.chars() {
+            deltas.extend(parser.push(&character.to_string(), false));
+        }
+        deltas.extend(parser.push("", true));
+        let content: String = deltas
+            .iter()
+            .filter_map(|x| x["content"].as_str())
+            .collect();
+        assert_eq!(content, "prefixsuffix");
+        assert_eq!(parser.calls, 1);
+        assert!(
+            deltas
+                .iter()
+                .any(|x| x["tool_calls"][0]["function"]["name"] == "f")
+        );
+        let mut truncated = ToolStream::new(true, "test".into());
+        assert!(truncated.push("<tool_call>", false).is_empty());
+        assert_eq!(
+            truncated.push("", true),
+            vec![json!({"content":"<tool_call>"})]
+        );
+    }
+    #[tokio::test]
+    async fn sse_emits_complete_tool_call_then_tool_finish_reason() {
+        use http_body_util::BodyExt;
+        let (sender, events) = tokio::sync::mpsc::channel(8);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for text in [
+            "<think>reason</think><tool_",
+            "call>{\"name\":\"f\",\"arguments\":{\"x\":1}}",
+            "</tool_call>",
+        ] {
+            sender
+                .send(GenerationEvent::Token(text.into()))
+                .await
+                .unwrap();
+        }
+        sender
+            .send(GenerationEvent::Finished(GenerationResult {
+                text: String::new(),
+                finish_reason: "stop".into(),
+                prompt_tokens: 1,
+                completion_tokens: 3,
+                cached_tokens: 0,
+                timings: Value::Null,
+                stats: Value::Null,
+            }))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = stream_response(
+            GenerationHandle { events, cancel },
+            "test".into(),
+            1,
+            "qwen".into(),
+            true,
+            false,
+            true,
+            false,
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let chunks: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let calls: Vec<&Value> = chunks
+            .iter()
+            .filter(|x| x["choices"][0]["delta"].get("tool_calls").is_some())
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(
+            calls[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"x\":1}"
+        );
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+    #[tokio::test]
+    async fn sse_finishes_with_usage_and_done() {
+        use http_body_util::BodyExt;
+        let (sender, events) = tokio::sync::mpsc::channel(8);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sender
+            .send(GenerationEvent::Token("<think>reason</th".into()))
+            .await
+            .unwrap();
+        sender
+            .send(GenerationEvent::Token("ink>answer".into()))
+            .await
+            .unwrap();
+        sender
+            .send(GenerationEvent::Finished(GenerationResult {
+                text: "<think>reason</think>answer".into(),
+                finish_reason: "stop".into(),
+                prompt_tokens: 12,
+                completion_tokens: 3,
+                cached_tokens: 8,
+                timings: Value::Null,
+                stats: Value::Null,
+            }))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = stream_response(
+            GenerationHandle {
+                events,
+                cancel: cancel.clone(),
+            },
+            "chatcmpl-test".into(),
+            1,
+            "qwen".into(),
+            true,
+            true,
+            false,
+            false,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        let events: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(events.last(), Some(&"[DONE]"));
+        let chunks: Vec<Value> = events[..events.len() - 1]
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "reason")
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk["choices"][0]["delta"]["content"] == "answer")
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+        );
+        let usage = chunks.last().unwrap();
+        assert_eq!(usage["usage"]["total_tokens"], 15);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 8);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+    #[tokio::test]
+    async fn dropping_sse_body_cancels_generation() {
+        let (_sender, events) = tokio::sync::mpsc::channel(1);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let response = stream_response(
+            GenerationHandle {
+                events,
+                cancel: cancel.clone(),
+            },
+            "cmpl-test".into(),
+            1,
+            "qwen".into(),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+        drop(response);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn native_prompt_can_open_thinking_before_generated_text() {
+        assert_eq!(
+            split_thinking("reason</think>answer", true),
+            ("answer", Some("reason"))
+        );
+        assert_eq!(split_thinking("unfinished", true), ("", Some("unfinished")));
+        let mut parser = ThinkingStream {
+            mode: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            parser.push("reason</th", false),
+            vec![json!({"reasoning_content":"reason"})]
+        );
+        assert_eq!(
+            parser.push("ink>answer", true),
+            vec![json!({"content":"answer"})]
+        );
+    }
+}
