@@ -32,7 +32,7 @@ def main():
         binary = staging / f"{prefix}-linux-aarch64"
         (binary / "bin").mkdir(parents=True)
         shutil.copy2(root / "target/release/open_rknpu2_lm_infer", binary / "bin")
-        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "CONTRIBUTING.md", "Cargo.lock"]:
+        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock"]:
             shutil.copy2(root / name, binary / name)
         shutil.copytree(root / "llm_generated_docs", binary / "llm_generated_docs")
         operator = binary / "native/rk_npu_matmul"

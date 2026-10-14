@@ -262,7 +262,12 @@ impl Backend {
             unsafe { rk_npu_iommu_domain_create(context.raw, domain_id) },
             rk_npu_iommu_domain_free,
             "NPU IOMMU domain",
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "cannot create NPU IOMMU domain {domain_id}; nonzero domains require RKNPU driver >= 0.9.0 with IOMMU enabled"
+            )
+        })?;
         if !options.tune_cache.as_os_str().is_empty() {
             std::fs::create_dir_all(&options.tune_cache)?;
         }
