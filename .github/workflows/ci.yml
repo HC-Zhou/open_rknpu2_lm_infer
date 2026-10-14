@@ -39,6 +39,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      - name: Configure Git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install Rust
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
