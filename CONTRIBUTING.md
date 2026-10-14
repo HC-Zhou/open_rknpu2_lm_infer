@@ -17,3 +17,5 @@ cargo test --release --locked
 性能报告包含模型格式、上下文、chunk、CPU/NPU mask、固定频率、调优缓存状态及原始样本。分别报告 prefill、decode 和历史 KV 深度；测速包含完整模型调用和输出头。结果与复现方式见 [VALIDATION.md](llm_generated_docs/VALIDATION.md)。
 
 PR 说明具体行为变化和验证结果。提交仅包含相关源码、文档与小型证据；模型文件、构建产物和实验目录由 `.gitignore` 排除。贡献按工程的 AGPL-3.0-only 许可证提供，第三方来源保留原许可和通知。
+
+GitHub ARM64 CI 执行上述自动检查并生成可下载的包；版本 tag 触发 Release CI。构建环境、附件内容和发布步骤见 [RELEASING.md](llm_generated_docs/RELEASING.md)。

@@ -71,6 +71,8 @@
 
 ## 快速开始
 
+预编译 ARM64 版本见 [Releases](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest)。适用于 Debian 11 / glibc 2.31 或更新的系统；解压后运行 `bin/open_rknpu2_lm_infer`，模型独立提供。
+
 在 RK3588 Linux 板上构建（rustup 会按 `rust-toolchain.toml` 自动安装 Rust 1.95）：
 
 ```sh
