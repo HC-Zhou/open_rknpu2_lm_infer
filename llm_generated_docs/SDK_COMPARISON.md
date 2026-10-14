@@ -69,12 +69,12 @@ Open 输入为 `mt19937(42) % vocab_size` 固定 IDs，独立测量空 KV prefil
 
 ```sh
 python3 scripts/run_board.py --wait-lock --report warm-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/performance-model --context 8192 \
-  --tune-cache /path/to/model-cache bench --prompt 24 --generate 1 \
+  target/release/open_rknpu2_lm_infer --model /path/to/performance-model --ctx-size 8192 \
+  --tune-cache /path/to/model-cache bench --n-prompt 24 --n-gen 1 \
   --repetitions 1 --report warm.json
 python3 scripts/run_board.py --wait-lock --report measured-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/performance-model --context 8192 \
-  --tune-cache /path/to/model-cache bench --prompt 0 --generate 128 --depth 3800 \
+  target/release/open_rknpu2_lm_infer --model /path/to/performance-model --ctx-size 8192 \
+  --tune-cache /path/to/model-cache bench --n-prompt 0 --n-gen 128 --n-depth 3800 \
   --repetitions 3 --report measured.json
 ```
 
@@ -83,5 +83,5 @@ C7 的32窗 PPL 使用其 tokenizer 从原始语料取得的32×512输入 IDs：
 ```sh
 python3 scripts/run_board.py --wait-lock --report ppl-clocks.json -- \
   target/release/open_rknpu2_lm_infer --model /path/to/C7-Rotate-QQQ \
-  --context 512 --chunk 64 --no-tune ppl --tokens-file wiki32.json --report ppl32.json
+  --ctx-size 512 --ubatch-size 64 --no-tune ppl --tokens-file wiki32.json --report ppl32.json
 ```

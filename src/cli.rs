@@ -34,15 +34,26 @@ pub struct ModelArgs {
         help = "Native safetensors model directory"
     )]
     pub model: Option<PathBuf>,
-    #[arg(long, global = true, default_value_t = 4096)]
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        global = true,
+        default_value_t = 4096,
+        help = "KV capacity in tokens; 0 selects the required bench capacity or model limit"
+    )]
     pub context: usize,
-    #[arg(long, global = true, default_value_t = 64)]
+    #[arg(
+        long = "ubatch-size",
+        global = true,
+        default_value_t = 64,
+        help = "Physical prefill batch size; also accepts -ub"
+    )]
     pub chunk: usize,
-    #[arg(long, global = true, default_value_t = 4)]
+    #[arg(short = 't', long, global = true, default_value_t = 4)]
     pub threads: usize,
     #[arg(long, global = true, default_value = "7", value_parser = parse_u32)]
     pub npu_mask: u32,
-    #[arg(long, global = true, default_value = "0xf0", value_parser = parse_u64)]
+    #[arg(short = 'C', long, global = true, default_value = "0xf0", value_parser = parse_u64)]
     pub cpu_mask: u64,
     #[arg(long, global = true)]
     pub tune_cache: Option<PathBuf>,
@@ -68,15 +79,25 @@ impl ModelArgs {
             .model
             .clone()
             .context("provide --model or set RKNPU_MODEL")?;
-        if self.context == 0 || self.chunk == 0 || self.threads == 0 || self.attention_tile == 0 {
-            bail!("context, chunk, threads and attention-tile must be positive");
+        if self.chunk == 0 || self.threads == 0 || self.attention_tile == 0 {
+            bail!("ubatch-size, threads and attention-tile must be positive");
         }
+        let context = if self.context == 0 {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+            config["max_position_embeddings"]
+                .as_u64()
+                .context("--ctx-size 0 requires max_position_embeddings in config.json")?
+                .min(32768) as usize
+        } else {
+            self.context
+        };
         if self.npu_mask == 0 || self.npu_mask > 7 {
             bail!("npu-mask must select one or more of the three NPU cores (1..7)");
         }
         Ok(ModelOptions {
             path,
-            context: self.context,
+            context,
             chunk: self.chunk,
             threads: self.threads,
             npu_mask: self.npu_mask,
@@ -98,10 +119,15 @@ fn default_tune_cache() -> PathBuf {
 pub enum Command {
     /// Generate text; read the prompt from stdin when omitted.
     Run {
+        input: Option<String>,
+        #[arg(short = 'p', long, conflicts_with = "input")]
         prompt: Option<String>,
-        #[arg(long, conflicts_with = "prompt")]
+        #[arg(short = 'f', long = "file", conflicts_with_all = ["input", "prompt"])]
         prompt_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(
+            long = "conversation",
+            help = "Apply the model chat template; also accepts -cnv"
+        )]
         chat_template: bool,
         #[arg(long)]
         thinking: bool,
@@ -112,7 +138,7 @@ pub enum Command {
     },
     /// Open an interactive terminal conversation.
     Chat {
-        #[arg(long)]
+        #[arg(long = "system-prompt", help = "System message; also accepts -sys")]
         system: Option<String>,
         #[arg(long)]
         thinking: bool,
@@ -132,14 +158,19 @@ pub enum Command {
     Inspect,
     /// Encode text or decode token IDs without opening the NPU.
     Tokenize {
+        input: Option<String>,
+        #[arg(short = 'p', long, conflicts_with = "input")]
         prompt: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long = "conversation",
+            help = "Apply the model chat template; also accepts -cnv"
+        )]
         chat_template: bool,
         #[arg(long)]
         thinking: bool,
-        #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with = "prompt")]
+        #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["input", "prompt"])]
         decode: Vec<u32>,
-        #[arg(long, conflicts_with_all = ["prompt", "decode"])]
+        #[arg(long, conflicts_with_all = ["input", "prompt", "decode"])]
         tokens_file: Option<PathBuf>,
     },
     /// Evaluate supplied token sequences and export logits for reference comparison.
@@ -162,28 +193,123 @@ pub enum Command {
         #[arg(long)]
         report: PathBuf,
     },
-    /// Measure prefill and cached decode on synthetic token sequences.
+    /// Benchmark independent pp/tg tests or a consecutive prefill+decode test (-pg).
     #[command(alias = "perf")]
-    Bench {
-        #[arg(long, default_value_t = 128)]
-        prompt: usize,
-        #[arg(long, default_value_t = 32)]
-        generate: usize,
-        #[arg(long, default_value_t = 3)]
-        repetitions: usize,
-        #[arg(long, default_value_t = 0)]
-        depth: usize,
-        #[arg(long)]
-        suite: Option<String>,
-        #[arg(long)]
-        report: Option<PathBuf>,
-    },
+    Bench(BenchArgs),
+}
+#[derive(Args)]
+pub struct BenchArgs {
+    #[arg(
+        short = 'p',
+        long = "n-prompt",
+        value_delimiter = ',',
+        default_value = "512",
+        help = "Independent prefill lengths; 0 skips prefill tests"
+    )]
+    pub n_prompt: Vec<usize>,
+    #[arg(
+        short = 'n',
+        long = "n-gen",
+        value_delimiter = ',',
+        default_value = "128",
+        help = "Independent decode lengths; 0 skips decode tests"
+    )]
+    pub n_gen: Vec<usize>,
+    #[arg(
+        short = 'd',
+        long = "n-depth",
+        value_delimiter = ',',
+        default_value = "0",
+        help = "Untimed KV prefix lengths before each test"
+    )]
+    pub n_depth: Vec<usize>,
+    #[arg(long = "n-prompt-gen", value_name = "PP,TG", value_parser = parse_prompt_gen,
+        help = "Consecutive prefill+decode pair; also accepts -pg PP,TG; repeat for multiple pairs")]
+    pub n_prompt_gen: Vec<PromptGen>,
+    #[arg(short = 'r', long, default_value_t = 3)]
+    pub repetitions: usize,
+    #[arg(long, conflicts_with_all = ["n_prompt", "n_gen", "n_depth", "n_prompt_gen"])]
+    pub suite: Option<String>,
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+}
+#[derive(Clone, Debug)]
+pub struct PromptGen(pub usize, pub usize);
+fn parse_prompt_gen(value: &str) -> std::result::Result<PromptGen, String> {
+    let (prompt, generate) = value
+        .split_once(',')
+        .ok_or("-pg requires two token counts: PP,TG")?;
+    Ok(PromptGen(
+        prompt.parse().map_err(|_| "invalid prefill token count")?,
+        generate.parse().map_err(|_| "invalid decode token count")?,
+    ))
+}
+impl BenchArgs {
+    fn cases(&self) -> Result<Vec<crate::bench::Case>> {
+        if let Some(suite) = &self.suite {
+            return crate::bench::suite_cases(suite);
+        }
+        let mut cases = Vec::new();
+        for &depth in &self.n_depth {
+            for &prompt in &self.n_prompt {
+                if prompt > 0 {
+                    cases.push(crate::bench::Case::new(prompt, 0, depth));
+                }
+            }
+            for &generate in &self.n_gen {
+                if generate > 0 {
+                    cases.push(crate::bench::Case::new(0, generate, depth));
+                }
+            }
+            for &PromptGen(prompt, generate) in &self.n_prompt_gen {
+                if prompt > 0 || generate > 0 {
+                    cases.push(crate::bench::Case::new(prompt, generate, depth));
+                }
+            }
+        }
+        anyhow::ensure!(
+            !cases.is_empty(),
+            "benchmark needs at least one pp, tg or pg test"
+        );
+        Ok(cases)
+    }
+}
+impl Cli {
+    pub fn parse_args() -> Self {
+        Self::parse_from(llama_args(std::env::args_os()))
+    }
+}
+fn llama_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut positional = false;
+    args.into_iter()
+        .map(|arg| {
+            if arg == "--" {
+                positional = true;
+            }
+            if !positional && arg == "-pg" {
+                "--n-prompt-gen".into()
+            } else if !positional && arg == "-ub" {
+                "--ubatch-size".into()
+            } else if !positional && arg == "-cnv" {
+                "--conversation".into()
+            } else if !positional && arg == "-sys" {
+                "--system-prompt".into()
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 #[derive(Args, Clone)]
 pub struct GenerationArgs {
-    #[arg(short = 'n', long, default_value_t = 256)]
+    #[arg(
+        short = 'n',
+        long = "n-predict",
+        visible_alias = "predict",
+        default_value_t = 256
+    )]
     pub max_tokens: usize,
-    #[arg(long, default_value_t = 0.6)]
+    #[arg(long = "temp", visible_alias = "temperature", default_value_t = 0.6)]
     pub temperature: f32,
     #[arg(long, default_value_t = 0.95)]
     pub top_p: f32,
@@ -191,7 +317,7 @@ pub struct GenerationArgs {
     pub top_k: usize,
     #[arg(long, default_value_t = 0.0)]
     pub min_p: f32,
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub seed: Option<u64>,
     #[arg(long, default_value_t = 1.0)]
     pub repeat_penalty: f32,
@@ -205,7 +331,7 @@ pub struct GenerationArgs {
 impl GenerationArgs {
     pub fn sampling(&self) -> Result<SamplingParams> {
         if self.max_tokens == 0 {
-            bail!("max-tokens must be positive");
+            bail!("n-predict must be positive");
         }
         if self.stop.iter().any(String::is_empty) {
             bail!("stop strings must be nonempty");
@@ -248,7 +374,19 @@ fn prompt(text: String, chat: bool, thinking: bool) -> Prompt {
     }
 }
 pub async fn execute(cli: Cli) -> Result<()> {
-    let options = cli.model.options()?;
+    let mut model_args = cli.model;
+    let bench_cases = if let Command::Bench(args) = &cli.command {
+        let cases = args.cases()?;
+        if model_args.context == 0 {
+            model_args.context = cases.iter().try_fold(model_args.chunk, |capacity, case| {
+                Ok::<_, anyhow::Error>(capacity.max(case.capacity()?))
+            })?;
+        }
+        Some(cases)
+    } else {
+        None
+    };
+    let options = model_args.options()?;
     match cli.command {
         Command::Inspect => {
             let config: serde_json::Value =
@@ -267,6 +405,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             );
         }
         Command::Tokenize {
+            input,
             prompt: text,
             chat_template,
             thinking,
@@ -282,8 +421,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
             } else if !decode.is_empty() {
                 println!("{}", codec.decode(&decode, false)?);
             } else {
-                let tokens =
-                    codec.encode(&prompt(read_prompt(text, None)?, chat_template, thinking))?;
+                let tokens = codec.encode(&prompt(
+                    read_prompt(text.or(input), None)?,
+                    chat_template,
+                    thinking,
+                ))?;
                 println!(
                     "{}",
                     serde_json::to_string(
@@ -293,6 +435,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Command::Run {
+            input,
             prompt: text,
             prompt_file,
             chat_template,
@@ -301,7 +444,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             generation,
         } => {
             let sampling = generation.sampling()?;
-            let text = read_prompt(text, prompt_file)?;
+            let text = read_prompt(text.or(input), prompt_file)?;
             let engine = Engine::start(options)?;
             let mut handle = engine.generate(GenerationRequest {
                 prompt: prompt(text, chat_template, thinking),
@@ -348,19 +491,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let engine = Engine::start(options)?;
             crate::api::serve(engine, &host, port, api_key).await?;
         }
-        Command::Bench {
-            prompt,
-            generate,
-            repetitions,
-            depth,
-            suite,
-            report,
-        } => match suite.as_deref() {
-            Some("representative") => crate::bench::suite(options, repetitions, report)?,
-            Some("contexts") => crate::bench::contexts(options, repetitions, report)?,
-            None => crate::bench::run(options, prompt, generate, repetitions, report, depth)?,
-            Some(other) => bail!("unknown benchmark suite: {other}"),
-        },
+        Command::Bench(args) => crate::bench::run(
+            options,
+            &bench_cases.expect("bench cases were validated before model options"),
+            args.repetitions,
+            args.report,
+        )?,
         Command::Eval {
             tokens_file,
             continuation_file,
@@ -374,4 +510,109 @@ pub async fn execute(cli: Cli) -> Result<()> {
         } => crate::ppl::run(options, tokens_file, score_start, report)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
+    }
+
+    #[test]
+    fn llama_resource_options_work_for_every_command() {
+        for command in [
+            vec!["inspect"],
+            vec!["bench"],
+            vec![
+                "run",
+                "-p",
+                "hello",
+                "--n-predict",
+                "32",
+                "--temp",
+                "0",
+                "-cnv",
+            ],
+            vec!["run", "-f", "prompt.txt"],
+            vec!["chat", "-n", "32", "-sys", "Be concise.", "-s", "42"],
+            vec!["serve"],
+            vec![
+                "eval",
+                "--tokens-file",
+                "ids.json",
+                "--dump-logits",
+                "logits.f32",
+            ],
+            vec!["ppl", "--tokens-file", "ids.json", "--report", "ppl.json"],
+            vec!["tokenize", "-p", "hello"],
+        ] {
+            let mut args = vec![
+                "infer", "-m", "model", "-c", "1024", "-ub", "32", "-t", "2", "-C", "0x30",
+            ];
+            args.extend(command);
+            let cli = parse(&args);
+            assert_eq!(
+                (
+                    cli.model.context,
+                    cli.model.chunk,
+                    cli.model.threads,
+                    cli.model.cpu_mask
+                ),
+                (1024, 32, 2, 0x30)
+            );
+        }
+    }
+
+    #[test]
+    fn llama_bench_cases_distinguish_pp_tg_and_pg() {
+        let cli = parse(&[
+            "infer", "bench", "-p", "512,1024", "-n", "128", "-d", "0,512",
+        ]);
+        let Command::Bench(args) = cli.command else {
+            panic!("expected bench")
+        };
+        assert_eq!(
+            args.cases().unwrap(),
+            vec![
+                crate::bench::Case::new(512, 0, 0),
+                crate::bench::Case::new(1024, 0, 0),
+                crate::bench::Case::new(0, 128, 0),
+                crate::bench::Case::new(512, 0, 512),
+                crate::bench::Case::new(1024, 0, 512),
+                crate::bench::Case::new(0, 128, 512),
+            ]
+        );
+        let cli = parse(&[
+            "infer", "bench", "-c", "0", "-p", "0", "-n", "0", "-pg", "512,128", "-pg", "1024,32",
+        ]);
+        let Command::Bench(args) = cli.command else {
+            panic!("expected bench")
+        };
+        let cases = args.cases().unwrap();
+        assert_eq!(
+            cases,
+            vec![
+                crate::bench::Case::new(512, 128, 0),
+                crate::bench::Case::new(1024, 32, 0)
+            ]
+        );
+        assert_eq!(cases[0].capacity().unwrap(), 640);
+        assert_eq!(cases[1].capacity().unwrap(), 1056);
+        let cli = parse(&["infer", "bench", "--suite", "contexts"]);
+        let Command::Bench(args) = cli.command else {
+            panic!("expected bench")
+        };
+        assert_eq!(args.cases().unwrap().len(), 6);
+        assert!(
+            Cli::try_parse_from(llama_args(["infer", "bench", "-pg", "512"].map(Into::into)))
+                .is_err()
+        );
+        let cli = parse(&["infer", "tokenize", "--", "-pg"]);
+        let Command::Tokenize { input, .. } = cli.command else {
+            panic!("expected tokenize")
+        };
+        assert_eq!(input.as_deref(), Some("-pg"));
+    }
 }

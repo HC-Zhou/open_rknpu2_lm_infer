@@ -20,11 +20,11 @@ pp 从空 KV 开始；decode128 的历史 KV 深度分别为512、1024、4096，
 
 ```sh
 python3 scripts/run_board.py --wait-lock --report warm-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/model --context 8192 \
+  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
   --tune-cache /path/to/model-cache bench --suite contexts \
   --repetitions 1 --report warm.json
 python3 scripts/run_board.py --wait-lock --report measured-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/model --context 8192 \
+  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
   --tune-cache /path/to/model-cache bench --suite contexts \
   --repetitions 3 --report measured.json
 ```

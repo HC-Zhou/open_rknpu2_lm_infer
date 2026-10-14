@@ -1,4 +1,3 @@
-use clap::Parser;
 use std::{env, os::unix::process::CommandExt, process::Command};
 
 fn main() {
@@ -32,7 +31,7 @@ async fn run() {
         .with_writer(std::io::stderr)
         .init();
     if let Err(error) =
-        open_rknpu2_lm_infer::cli::execute(open_rknpu2_lm_infer::cli::Cli::parse()).await
+        open_rknpu2_lm_infer::cli::execute(open_rknpu2_lm_infer::cli::Cli::parse_args()).await
     {
         eprintln!("Error: {error:#}");
         std::process::exit(1);

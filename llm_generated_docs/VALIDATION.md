@@ -50,7 +50,7 @@ NLL 使用 FP32 shifted exp、FP64词表求和和 log，与 `.paper` 的 scorer 
 在板上复现前缀评分：
 
 ```sh
-target/release/open_rknpu2_lm_infer --model /path/to/model --context 512 --chunk 64 \
+target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 512 --ubatch-size 64 \
   --no-tune ppl --tokens-file wiki32.json --report ppl32.json
 ```
 
@@ -86,7 +86,7 @@ cargo test --release --locked --lib npu::tests -- --ignored --test-threads=1
 
 ```sh
 target/release/open_rknpu2_lm_infer eval --model /path/to/model \
-  --context 4096 --no-tune --tokens-file prompt.json \
+  --ctx-size 4096 --no-tune --tokens-file prompt.json \
   --continuation-file continuation.json --dump-logits rust.f32
 python3 scripts/compare_logits.py native.f32 rust.f32 \
   --vocab 151936 --max-nrmse 0 --report logits-comparison.json

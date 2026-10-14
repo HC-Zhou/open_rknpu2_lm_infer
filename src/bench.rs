@@ -20,30 +20,31 @@ fn summary(samples: &[f64], tokens: usize) -> serde_json::Value {
     json!({"tokens":tokens,"samples_ms":samples,"samples_tokens_per_second":speeds,"mean_tokens_per_second":mean,"stddev_tokens_per_second":stddev})
 }
 
-pub fn run(
-    options: ModelOptions,
-    prompt: usize,
-    generate: usize,
-    repetitions: usize,
-    report: Option<PathBuf>,
-    depth: usize,
-) -> Result<()> {
-    run_cases(options, &[(prompt, generate, depth)], repetitions, report)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Case {
+    pub prompt: usize,
+    pub generate: usize,
+    pub depth: usize,
 }
-
-pub fn suite(options: ModelOptions, repetitions: usize, report: Option<PathBuf>) -> Result<()> {
-    run_cases(
-        options,
-        &[(512, 0, 0), (4096, 0, 0), (0, 128, 0), (0, 128, 2048)],
-        repetitions,
-        report,
-    )
+impl Case {
+    pub fn new(prompt: usize, generate: usize, depth: usize) -> Self {
+        Self {
+            prompt,
+            generate,
+            depth,
+        }
+    }
+    pub fn capacity(&self) -> Result<usize> {
+        self.depth
+            .checked_add(self.prompt)
+            .and_then(|tokens| tokens.checked_add(self.generate))
+            .ok_or_else(|| anyhow::anyhow!("benchmark token counts exceed context capacity"))
+    }
 }
-
-pub fn contexts(options: ModelOptions, repetitions: usize, report: Option<PathBuf>) -> Result<()> {
-    run_cases(
-        options,
-        &[
+pub fn suite_cases(name: &str) -> Result<Vec<Case>> {
+    let cases: &[(usize, usize, usize)] = match name {
+        "representative" => &[(512, 0, 0), (4096, 0, 0), (0, 128, 0), (0, 128, 2048)],
+        "contexts" => &[
             (512, 0, 0),
             (1024, 0, 0),
             (4096, 0, 0),
@@ -51,32 +52,31 @@ pub fn contexts(options: ModelOptions, repetitions: usize, report: Option<PathBu
             (0, 128, 1024),
             (0, 128, 4096),
         ],
-        repetitions,
-        report,
-    )
+        other => anyhow::bail!("unknown benchmark suite: {other}"),
+    };
+    Ok(cases.iter().map(|&(p, n, d)| Case::new(p, n, d)).collect())
 }
-
-fn run_cases(
+pub fn run(
     options: ModelOptions,
-    cases: &[(usize, usize, usize)],
+    cases: &[Case],
     repetitions: usize,
     report: Option<PathBuf>,
 ) -> Result<()> {
     ensure!(
         repetitions > 0
+            && !cases.is_empty()
             && cases
                 .iter()
-                .all(|&(prompt, generate, _)| prompt > 0 || generate > 0),
+                .all(|case| case.prompt > 0 || case.generate > 0),
         "benchmark needs repetitions and at least one phase"
     );
-    let capacity = cases
-        .iter()
-        .map(|&(prompt, generate, depth)| prompt.max(generate).saturating_add(depth))
-        .max()
-        .unwrap_or(0);
+    let capacity = cases.iter().try_fold(0, |capacity, case| {
+        Ok::<_, anyhow::Error>(capacity.max(case.capacity()?))
+    })?;
     ensure!(
         capacity <= options.context,
-        "benchmark exceeds context capacity"
+        "benchmark needs {capacity} KV tokens but --ctx-size is {}; increase --ctx-size or use -c 0",
+        options.context
     );
     let _lock = BoardLock::acquire()?;
     let mut model = model::load(options)?;
@@ -85,32 +85,46 @@ fn run_cases(
         .map(|_| rng.next() % model.info().vocab_size as u32)
         .collect();
     let mut results = Vec::new();
-    for &(prompt, generate, depth) in cases {
-        model.reserve(prompt.max(generate) + depth)?;
+    for &case in cases {
+        let Case {
+            prompt,
+            generate,
+            depth,
+        } = case;
+        model.reserve(case.capacity()?)?;
         eprintln!("bench: pp{prompt} tg{generate} depth{depth}, warmup");
-        measure_phases(model.as_mut(), &tokens, prompt, generate, depth)?;
+        measure_phases(model.as_mut(), &tokens, case)?;
         let mut pp = Vec::new();
         let mut tg = Vec::new();
+        let mut pg = Vec::new();
         for repetition in 0..repetitions {
-            let (prefill, decode) =
-                measure_phases(model.as_mut(), &tokens, prompt, generate, depth)?;
+            let (prefill, decode) = measure_phases(model.as_mut(), &tokens, case)?;
             eprintln!(
                 "bench: sample {}/{repetitions}, prefill {prefill:.3} ms, decode {decode:.3} ms",
                 repetition + 1
             );
             pp.push(prefill);
             tg.push(decode);
+            pg.push(prefill + decode);
         }
         results.push(json!({"prompt":prompt,"generate":generate,"depth":depth,
             "prefill":if prompt>0 {summary(&pp,prompt)} else {serde_json::Value::Null},
-            "decode":if generate>0 {summary(&tg,generate)} else {serde_json::Value::Null},"stats":model.stats()}));
+            "decode":if generate>0 {summary(&tg,generate)} else {serde_json::Value::Null},
+            "prompt_gen":if prompt>0 && generate>0 {summary(&pg,prompt+generate)} else {serde_json::Value::Null},"stats":model.stats()}));
     }
     let mut result = json!({"model":model.info(),"warmup":1,"repetitions":repetitions,
-        "timing":"independent pp and tg; complete synchronous model calls including output head; excludes load, preparation, untimed depth prefill, tokenization, sampling",
+        "timing":"independent pp/tg cases; pg preserves prefill KV for decode; complete synchronous model calls including output head; excludes load, preparation, untimed depth prefill, tokenization, sampling",
         "seed":42,"token_source":"mt19937(seed) % vocab_size","synthetic_token_ids":tokens,
         "cases":results,"stats":model.stats()});
     if cases.len() == 1 {
-        for key in ["prompt", "generate", "depth", "prefill", "decode"] {
+        for key in [
+            "prompt",
+            "generate",
+            "depth",
+            "prefill",
+            "decode",
+            "prompt_gen",
+        ] {
             result[key] = results[0][key].clone();
         }
     }
@@ -124,35 +138,28 @@ fn run_cases(
     Ok(())
 }
 
-fn measure_phases(
-    model: &mut dyn LanguageModel,
-    tokens: &[u32],
-    prompt: usize,
-    generate: usize,
-    depth: usize,
-) -> Result<(f64, f64)> {
+fn measure_phases(model: &mut dyn LanguageModel, tokens: &[u32], case: Case) -> Result<(f64, f64)> {
+    let Case {
+        prompt,
+        generate,
+        depth,
+    } = case;
+    model.reset()?;
+    if depth > 0 {
+        model.prepare(depth)?;
+        model.forward(&tokens[..depth])?;
+    }
+    model.prepare(prompt.max(1))?;
     let mut pp = 0.0;
     if prompt > 0 {
-        model.reset()?;
-        if depth > 0 {
-            model.prepare(depth)?;
-            model.forward(&tokens[..depth])?;
-        }
-        model.prepare(prompt)?;
         let start = Instant::now();
         model.forward(&tokens[depth..depth + prompt])?;
         pp = start.elapsed().as_secs_f64() * 1000.0;
     }
     let mut tg = 0.0;
     if generate > 0 {
-        model.reset()?;
-        if depth > 0 {
-            model.prepare(depth)?;
-            model.forward(&tokens[..depth])?;
-        }
-        model.prepare(1)?;
         let start = Instant::now();
-        for &token in &tokens[depth..depth + generate] {
+        for &token in &tokens[depth + prompt..depth + prompt + generate] {
             model.forward(&[token])?;
         }
         tg = start.elapsed().as_secs_f64() * 1000.0;
@@ -197,6 +204,70 @@ impl Mt19937 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct RecordingModel {
+        info: crate::model::ModelInfo,
+        position: usize,
+        resets: usize,
+        forwards: Vec<(usize, Vec<u32>)>,
+        logits: [f32; 1],
+    }
+    impl LanguageModel for RecordingModel {
+        fn info(&self) -> &crate::model::ModelInfo {
+            &self.info
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.resets += 1;
+            self.position = 0;
+            Ok(())
+        }
+        fn prepare(&mut self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
+            self.forwards.push((self.position, tokens.to_vec()));
+            self.position += tokens.len();
+            Ok(&self.logits)
+        }
+        fn position(&self) -> usize {
+            self.position
+        }
+        fn stats(&self) -> serde_json::Value {
+            json!({})
+        }
+    }
+
+    #[test]
+    fn pg_preserves_prefill_kv_and_consumes_continuation_ids() -> Result<()> {
+        let mut model = RecordingModel {
+            info: crate::model::ModelInfo {
+                id: "test".into(),
+                architecture: "test".into(),
+                context: 16,
+                vocab_size: 100,
+                eos_tokens: vec![],
+            },
+            position: 0,
+            resets: 0,
+            forwards: vec![],
+            logits: [0.0],
+        };
+        measure_phases(&mut model, &[10, 11, 12, 13, 14, 15], Case::new(3, 2, 1))?;
+        assert_eq!(model.resets, 1);
+        assert_eq!(
+            model.forwards,
+            vec![
+                (0, vec![10]),
+                (1, vec![11, 12, 13]),
+                (4, vec![14]),
+                (5, vec![15])
+            ]
+        );
+        assert_eq!(model.position, 6);
+        Ok(())
+    }
+
     #[test]
     fn synthetic_ids_follow_std_mt19937() {
         let mut rng = super::Mt19937::new(5489);

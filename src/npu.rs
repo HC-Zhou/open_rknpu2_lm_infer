@@ -33,11 +33,11 @@ pub fn configure_cpu(options: &mut ModelOptions) -> Result<()> {
     );
     ensure!(
         (1..=128).contains(&options.chunk),
-        "chunk must be within 1..128"
+        "ubatch-size must be within 1..128"
     );
     ensure!(
         (1..=32768).contains(&options.context),
-        "context must be within 1..32768"
+        "ctx-size must be within 1..32768"
     );
     ensure!(
         [256, 512, 1024, 2048, 4096].contains(&options.attention_tile),

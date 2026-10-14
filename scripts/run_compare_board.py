@@ -31,14 +31,14 @@ def main():
         label=f"{args.mode}-{label}" if not measured_run else label
         report=args.output/f"{label}.json"
         clock=args.output/f"{label}-clocks.json"
-        common=["--context","4096","--chunk","64","--threads","4","--cpu-mask","0xf0","--npu-mask","7","--attention-tile","512","--tune-cache",str(caches[kind]),"--report",str(report)]
+        common=["--threads","4","--cpu-mask","0xf0","--npu-mask","7","--attention-tile","512","--tune-cache",str(caches[kind]),"--report",str(report)]
         if kind=="native":
             logical_batch=4096 if args.mode=="representative" else 512
-            command=[str(args.native_bin),"perf","--model",str(args.model),*common,"-b",str(logical_batch),"-r",str(repetitions)]
+            command=[str(args.native_bin),"perf","--model",str(args.model),"--context","4096","--chunk","64",*common,"-b",str(logical_batch),"-r",str(repetitions)]
             command += ["--suite","representative"] if args.mode=="representative" else ["-p","512","-n","128"]
         else:
-            command=[str(args.rust_bin),"bench","--model",str(args.model),*common,"--repetitions",str(repetitions)]
-            command += ["--suite","representative"] if args.mode=="representative" else ["--prompt","512","--generate","128"]
+            command=[str(args.rust_bin),"bench","--model",str(args.model),"--ctx-size","4096","--ubatch-size","64",*common,"--repetitions",str(repetitions)]
+            command += ["--suite","representative"] if args.mode=="representative" else ["-p","512","-n","128"]
         print(label,flush=True)
         with (args.output/f"{label}.log").open("w") as log:
             subprocess.run([sys.executable,str(scripts/"run_board.py"),"--wait-lock","--report",str(clock),"--",*command],stdout=log,stderr=subprocess.STDOUT,check=True)
