@@ -83,6 +83,9 @@ sudo apt install curl jq python3-pip libgomp1 libstdc++6
 curl -fL "$(curl -fsSL https://api.github.com/repos/happyme531/open_rknpu2_lm_infer/releases/latest | jq -r '.assets[] | select(.name | endswith("-linux-aarch64.tar.gz")) | .browser_download_url')" | tar -xz --strip-components=1
 pip3 install 'huggingface_hub[cli]>=0.34,<1'
 hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+# 将大核CPU频率固定为最高。可选，但如果不操作会大幅影响推理速度。可能需要root权限。
+# echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
+# echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot chat
 ```
 
@@ -90,27 +93,16 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 ## 跑出完整调优性能
 
-推理只读取已有调优结果，缺失时使用内置策略，**首次请求也不会自动调优**。要获得调优后的吞吐并覆盖聊天尾块，请针对模型和资源配置显式准备一次。首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
-
-Release附件已包含 `scripts/run_board.py`。它持有共享NPU锁，为命令固定CPU/NPU/DDR频率，并在退出时恢复。在具有可用sudo权限的RK3588板上运行：
+推理程序使用的默认的推理策略并非最优性能。可以针对指定的模型手动调优一次。
 
 ```sh
-export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub128"
-sudo -v
-python3 scripts/run_board.py --report tune-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" tune --report tune.json
-python3 scripts/run_board.py --report bench-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
-./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" chat
+# 将大核CPU频率固定为最高。强烈建议执行。
+echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
+echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 ```
 
-源码构建时，将 `./bin/open_rknpu2_lm_infer` 替换为 `target/release/open_rknpu2_lm_infer`。启动 `chat` 或 `serve` 时保持模型、上下文、ubatch、CPU/NPU配置和缓存目录一致；不同模型使用独立目录。默认ubatch为128，`tune`默认准备 `1,128` 两档。需要优化不规则聊天尾块时，可显式指定 `--batches 1,2,4,8,16,32,64,128`。也支持192和256：各处统一设置相应的 `--ubatch-size`，默认调优档位会随之改变。Attention 按独立的小块执行。
-
-完整准备后的benchmark应满足 `stats.tune_calls`、`stats.weight_reload_calls`、`stats.strategy_fallback_calls`全为0。`tune_cache_misses`可能包含未采用的W8分块候选，不能代替实际执行计数。两个频率报告应显示 `exit_code: 0`、`restore_errors: []`。空缓存可以直接推理，但内置策略不保证达到表中的峰值性能。详见[使用说明](llm_generated_docs/USAGE.md)和[测速口径](llm_generated_docs/PERFORMANCE.md)。
+首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
 
 ## 架构
 

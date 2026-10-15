@@ -83,6 +83,9 @@ sudo apt install curl jq python3-pip libgomp1 libstdc++6
 curl -fL "$(curl -fsSL https://api.github.com/repos/happyme531/open_rknpu2_lm_infer/releases/latest | jq -r '.assets[] | select(.name | endswith("-linux-aarch64.tar.gz")) | .browser_download_url')" | tar -xz --strip-components=1
 pip3 install 'huggingface_hub[cli]>=0.34,<1'
 hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+# Set the big CPU cores to their maximum frequency. Optional, but skipping this can significantly reduce inference speed. Root privileges may be required.
+# echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
+# echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot chat
 ```
 
@@ -90,27 +93,16 @@ Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-c
 
 ## Getting full tuned performance
 
-Inference reads existing tuning results and uses built-in strategies for missing entries. It **does not tune automatically**, including on the first request. Run the explicit preparation below once per model and resource configuration to reach tuned throughput and cover short chat tails. The first run can take several minutes; progress and the best candidate time are shown, and valid cache entries are reused on later runs.
-
-The release archive includes `scripts/run_board.py`. It holds the shared NPU lock, fixes CPU/NPU/DDR clocks for the command, and restores them on exit. Run on the RK3588 board with working `sudo` access:
+The default inference strategies do not deliver optimal performance. You can manually tune once for a specific model.
 
 ```sh
-export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub128"
-sudo -v
-python3 scripts/run_board.py --report tune-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" tune --report tune.json
-python3 scripts/run_board.py --report bench-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
-./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
-  --tune-cache "$RKNPU_TUNE_CACHE" chat
+# Set the big CPU cores to their maximum frequency. Strongly recommended.
+echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
+echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 ```
 
-For a source build, replace `./bin/open_rknpu2_lm_infer` with `target/release/open_rknpu2_lm_infer`. Use the same model, context, batch size, CPU/NPU settings and cache directory when starting `chat` or `serve`. Keep separate cache directories for different models. The default batch is 128, and `tune` prepares batches `1,128` by default. To tune irregular chat tails too, explicitly use `--batches 1,2,4,8,16,32,64,128`. Batches 192 and 256 are also supported: use the same `--ubatch-size` throughout; the default tuning batches follow that setting. Attention uses its own query segments.
-
-In a fully prepared benchmark, `stats.tune_calls`, `stats.weight_reload_calls` and `stats.strategy_fallback_calls` should all be 0. `tune_cache_misses` can include unused W8 partition candidates, so it is not a substitute for these checks. Both clock reports should have `exit_code: 0` and an empty `restore_errors` list. Empty-cache inference remains usable, but its built-in strategies may not reach the tabled performance. See [usage](llm_generated_docs/USAGE.md) and [performance protocol](llm_generated_docs/PERFORMANCE.md).
+The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
 
 ## Architecture
 
