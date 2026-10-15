@@ -94,6 +94,10 @@ target/release/open_rknpu2_lm_infer --ctx-size 8192 bench --suite contexts \
 
 `ppl --tokens-file WINDOWS.json --report ppl.json` 对独立、等长的 token 窗口计算 next-token PPL。输入为二维 token ID 数组；默认从零起始 target 位置257评分至窗口末尾，对应512-token窗口的后255个 target。模型按 chunk 批量执行 NPU 输出头，NLL 使用 FP32 shifted exp 与 FP64 sum/log，报告逐 token NLL、每窗口耗时和累计 PPL。报告每窗口保存一次；同一命令可继续未完成的评测。
 
+Attention 默认使用 NPU LUT exponential + PINGPONG。在启动进程前设置
+`RK_NPU_ATTN_LUT_EXP=0` 恢复原有 CPU softmax。数值、PPL 与性能结果见
+[Attention LUT](ATTENTION_LUT.md)。
+
 固定频率与板锁由 `scripts/run_board.py` 管理，用法见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ## 独立源码包

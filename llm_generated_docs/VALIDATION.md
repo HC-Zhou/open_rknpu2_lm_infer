@@ -2,6 +2,10 @@
 
 验证平台为 RK3588 Linux，Rust 1.95.0、GCC 10。模型为 `Qwen3-4B-W4A8-Mixed-LMHeadW8`，36 层，vocab151936，原生 FP16 GQA，W8 NPU lm_head。
 
+默认 Attention 使用 NPU LUT exponential + PINGPONG，性能与配对 PPL 见
+[Attention LUT](ATTENTION_LUT.md)。以下逐值 reference 对齐结果采用原有 CPU softmax；
+设置 `RK_NPU_ATTN_LUT_EXP=0` 可恢复该路径。
+
 ## 数值与功能
 
 | 检查 | 结果 |
