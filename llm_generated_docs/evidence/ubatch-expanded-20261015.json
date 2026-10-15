@@ -30,7 +30,8 @@
     "warmup_per_case": 1,
     "formal_samples_per_case": 3,
     "note": "Sequential small sweep, not ABBA. Explicit ignored probe prepares missing strategies offline in the same model instance; timed counter increments must be zero. Decode8 is a teacher-forced correctness continuation, not a formal decode throughput benchmark.",
-    "initial_wrapper_failure": "The initial Attention test used four CPUs with threads=2 and failed configuration before submits; the model sweep continued and passed. Corrected Attention test ran separately."
+    "initial_wrapper_failure": "The initial Attention test used four CPUs with threads=2 and failed configuration before submits; the model sweep continued and passed. Corrected Attention test ran separately.",
+    "publication_note": "The local model-directory prefix in the recorded shell command is replaced with /path/to; measurement samples and counters are unchanged."
   },
   "summary": [
     {
@@ -2925,7 +2926,7 @@
       "command": [
         "bash",
         "-c",
-        "cargo test --release --locked --lib quantized_linear_padding_and_swiglu -- --ignored --nocapture --test-threads=1 && RKNPU_MODEL=/home/firefly/mnt/3090x4/llm/w4a8_quant/Qwen3-4B-W4A8-Mixed-LMHeadW8 RKNPU_TUNE_CACHE=.cache/perf-contexts/qwen3 RKNPU_UBATCH_REPORT=results/ubatch-expanded-20261015.json cargo test --release --locked --lib large_ubatch -- --ignored --nocapture --test-threads=1"
+        "cargo test --release --locked --lib quantized_linear_padding_and_swiglu -- --ignored --nocapture --test-threads=1 && RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-LMHeadW8 RKNPU_TUNE_CACHE=.cache/perf-contexts/qwen3 RKNPU_UBATCH_REPORT=results/ubatch-expanded-20261015.json cargo test --release --locked --lib large_ubatch -- --ignored --nocapture --test-threads=1"
       ],
       "started_unix": 1792031748.814604,
       "restore_errors": [],
