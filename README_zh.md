@@ -96,19 +96,19 @@ Release附件已包含 `scripts/run_board.py`。它持有共享NPU锁，为命�
 
 ```sh
 export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub64"
+export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub128"
 sudo -v
 python3 scripts/run_board.py --report tune-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
-  --tune-cache "$RKNPU_TUNE_CACHE" tune --batches 1,2,4,8,16,32,64 --report tune.json
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
+  --tune-cache "$RKNPU_TUNE_CACHE" tune --report tune.json
 python3 scripts/run_board.py --report bench-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
   --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
-./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
   --tune-cache "$RKNPU_TUNE_CACHE" chat
 ```
 
-源码构建时，将 `./bin/open_rknpu2_lm_infer` 替换为 `target/release/open_rknpu2_lm_infer`。启动 `chat` 或 `serve` 时保持模型、上下文、ubatch、CPU/NPU配置和缓存目录一致；不同模型使用独立目录。若只准备batch64的吞吐测速，`tune --batches 1,64`即可，其余档位用于不规则聊天尾块。也支持128：各处统一设置 `--ubatch-size 128`，并在调优列表中加入128。
+源码构建时，将 `./bin/open_rknpu2_lm_infer` 替换为 `target/release/open_rknpu2_lm_infer`。启动 `chat` 或 `serve` 时保持模型、上下文、ubatch、CPU/NPU配置和缓存目录一致；不同模型使用独立目录。默认ubatch为128，`tune`默认准备 `1,128` 两档。需要优化不规则聊天尾块时，可显式指定 `--batches 1,2,4,8,16,32,64,128`。也支持192和256：各处统一设置相应的 `--ubatch-size`，默认调优档位会随之改变。Attention 按独立的小块执行。
 
 完整准备后的benchmark应满足 `stats.tune_calls`、`stats.weight_reload_calls`、`stats.strategy_fallback_calls`全为0。`tune_cache_misses`可能包含未采用的W8分块候选，不能代替实际执行计数。两个频率报告应显示 `exit_code: 0`、`restore_errors: []`。空缓存可以直接推理，但内置策略不保证达到表中的峰值性能。详见[使用说明](llm_generated_docs/USAGE.md)和[测速口径](llm_generated_docs/PERFORMANCE.md)。
 

@@ -36,7 +36,7 @@ TUI 支持 Enter 发送、Shift+Enter 或 Alt+Enter 换行、Esc 取消生成、
 | 参数 | 默认值 |
 |---|---|
 | `-c, --ctx-size` | 4096（KV 容量） |
-| `-ub, --ubatch-size` | 64（实际 prefill 块大小） |
+| `-ub, --ubatch-size` | 128（实际 prefill 块大小） |
 | `-t, --threads` | 4 |
 | `-C, --cpu-mask` | `0xf0` |
 | `--npu-mask` | 7 |
@@ -51,12 +51,12 @@ OpenMP 等待默认配置为 `OMP_WAIT_POLICY=PASSIVE`、`GOMP_SPINCOUNT=0`。�
 
 普通推理与评测只读取已有策略；空缓存和新 batch bucket 使用内置回退配置，不进行性能搜索或写缓存。`--tune-cache` 指定目录，默认是 `$XDG_CACHE_HOME/open_rknpu2_lm_infer` 或 `~/.cache/open_rknpu2_lm_infer`。`--no-tune` 跳过缓存并使用内置配置。
 
-需要优化策略时显式运行 `tune`。默认准备 decode 和主 prefill；`--batches` 选择实际长度，会按运行时的2的幂 bucket 准备。支持 `ubatch-size` 1–128；256目前仅在算子实验中测试。
+需要优化策略时显式运行 `tune`。默认准备 decode 和主 prefill，即默认配置下的 `1,128`；显式修改 `--ubatch-size` 后，默认调优档位随之改变。`--batches` 可选择其他实际长度。支持 `ubatch-size` 1–256：不超过128的 Linear 档位向上取2的幂，超过128使用192或256行配置，因此192不会补成256。Attention 独立分段执行，每次公开调用最多128行。选择192或256时，调优和推理都应设置相同的 `--ubatch-size`。
 
 ```sh
 python3 scripts/run_board.py --report tune-clocks.json -- \
   target/release/open_rknpu2_lm_infer --tune-cache /path/to/model-cache \
-  tune --batches 1,4,32,64 --report tune.json
+  tune --report tune.json
 ```
 
 调优反馈写入 stderr，包含 batch、domain、形状编号、缓存命中、候选进度、最佳完整调用耗时和已用时间。终端中的 W4 进度条原地刷新；重定向到文件时保留进度记录。已有有效缓存直接复用。当前仍使用既有完整搜索算法，未增加候选或时间预算。

@@ -45,7 +45,7 @@ pub struct ModelArgs {
     #[arg(
         long = "ubatch-size",
         global = true,
-        default_value_t = 64,
+        default_value_t = 128,
         help = "Physical prefill batch size; also accepts -ub"
     )]
     pub chunk: usize,
@@ -204,7 +204,7 @@ pub enum Command {
     /// Explicitly search missing strategies and save them for later inference.
     Tune {
         #[arg(long, value_delimiter = ',', num_args = 1..,
-            help = "Actual prefill lengths to prepare; default: decode and ubatch")]
+            help = "Actual prefill lengths to prepare; default: 1 and --ubatch-size")]
         batches: Vec<usize>,
         #[arg(long, help = "Write final statistics as JSON")]
         report: Option<PathBuf>,

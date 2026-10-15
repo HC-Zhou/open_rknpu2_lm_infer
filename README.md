@@ -96,19 +96,19 @@ The release archive includes `scripts/run_board.py`. It holds the shared NPU loc
 
 ```sh
 export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub64"
+export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub128"
 sudo -v
 python3 scripts/run_board.py --report tune-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
-  --tune-cache "$RKNPU_TUNE_CACHE" tune --batches 1,2,4,8,16,32,64 --report tune.json
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
+  --tune-cache "$RKNPU_TUNE_CACHE" tune --report tune.json
 python3 scripts/run_board.py --report bench-clocks.json -- \
-  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
   --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
-./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 128 \
   --tune-cache "$RKNPU_TUNE_CACHE" chat
 ```
 
-For a source build, replace `./bin/open_rknpu2_lm_infer` with `target/release/open_rknpu2_lm_infer`. Use the same model, context, batch size, CPU/NPU settings and cache directory when starting `chat` or `serve`. Keep separate cache directories for different models. For throughput-only preparation at batch64, `tune --batches 1,64` is sufficient; the other batches cover irregular chat tails. Batch128 is also supported: set `--ubatch-size 128` consistently and add 128 to `--batches`.
+For a source build, replace `./bin/open_rknpu2_lm_infer` with `target/release/open_rknpu2_lm_infer`. Use the same model, context, batch size, CPU/NPU settings and cache directory when starting `chat` or `serve`. Keep separate cache directories for different models. The default batch is 128, and `tune` prepares batches `1,128` by default. To tune irregular chat tails too, explicitly use `--batches 1,2,4,8,16,32,64,128`. Batches 192 and 256 are also supported: use the same `--ubatch-size` throughout; the default tuning batches follow that setting. Attention uses its own query segments.
 
 In a fully prepared benchmark, `stats.tune_calls`, `stats.weight_reload_calls` and `stats.strategy_fallback_calls` should all be 0. `tune_cache_misses` can include unused W8 partition candidates, so it is not a substitute for these checks. Both clock reports should have `exit_code: 0` and an empty `restore_errors` list. Empty-cache inference remains usable, but its built-in strategies may not reach the tabled performance. See [usage](llm_generated_docs/USAGE.md) and [performance protocol](llm_generated_docs/PERFORMANCE.md).
 

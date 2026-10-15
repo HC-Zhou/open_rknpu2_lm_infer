@@ -20,11 +20,11 @@ pp 从空 KV 开始；decode128 的历史 KV 深度分别为512、1024、4096，
 
 ```sh
 python3 scripts/run_board.py --wait-lock --report warm-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
+  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 --ubatch-size 64 \
   --tune-cache /path/to/model-cache tune --batches 1,64 \
   --report tune.json
 python3 scripts/run_board.py --wait-lock --report measured-clocks.json -- \
-  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
+  target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 --ubatch-size 64 \
   --tune-cache /path/to/model-cache bench --suite contexts \
   --repetitions 3 --report measured.json
 ```
@@ -91,3 +91,7 @@ python3 scripts/run_compare_board.py --model /path/to/model \
 ## 限制
 
 吞吐结果对应上述三款 mixed checkpoint 与 RK3588。C++ native 对照和 RSS 数据对应 Qwen3-4B、context4096。RSS 和各对象 payload 使用不同统计口径；RSS 不替代完整设备与内核内存统计。其他模型格式、上下文和采样服务负载需要分别测量。
+
+## ubatch128/192/256 后续小测
+
+应用默认ubatch已改为128；[完整模型小测](UBATCH_SWEEP_20261015.md)记录128/192/256的吞吐和数值比较。上文历史chunk64数据及复现参数保留原值。

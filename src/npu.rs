@@ -21,6 +21,10 @@ mod ffi {
 }
 use ffi::*;
 
+#[cfg(test)]
+#[path = "npu/ubatch_probe.rs"]
+mod ubatch_probe;
+
 unsafe extern "C" {
     fn omp_set_dynamic(value: libc::c_int);
     fn omp_set_num_threads(value: libc::c_int);
@@ -32,8 +36,8 @@ pub fn configure_cpu(options: &mut ModelOptions) -> Result<()> {
         "threads must be within 1..4"
     );
     ensure!(
-        (1..=128).contains(&options.chunk),
-        "ubatch-size must be within 1..128"
+        (1..=256).contains(&options.chunk),
+        "ubatch-size must be within 1..256"
     );
     ensure!(
         (1..=32768).contains(&options.context),
@@ -134,10 +138,14 @@ fn check_cache_miss(rc: i32, name: &str) -> Result<()> {
 }
 fn bucket(rows: usize) -> Result<usize> {
     ensure!(
-        (1..=128).contains(&rows),
-        "linear batch must be within 1..128"
+        (1..=256).contains(&rows),
+        "linear batch must be within 1..256"
     );
-    Ok(rows.next_power_of_two())
+    Ok(if rows <= 128 {
+        rows.next_power_of_two()
+    } else {
+        rows.div_ceil(64) * 64
+    })
 }
 
 struct Work {
@@ -214,7 +222,8 @@ fn attention_config(
     config.kv_heads = kv_heads as i32;
     config.head_dim = dimension as i32;
     config.softmax_scale = softmax_scale;
-    config.max_query_rows = options.chunk as i32;
+    // Keep the public Attention call size independent of the Linear batch.
+    config.max_query_rows = options.chunk.min(128) as i32;
     config.max_capacity = options.context.div_ceil(32) as i32 * 32;
     config.initial_capacity = config.max_capacity.min(128);
     config.core_mask = options.npu_mask;
@@ -1241,6 +1250,8 @@ mod tests {
         let cache = tempfile::tempdir()?;
         let mut options = options(cache.path())?;
         options.tune = true;
+        options.chunk = 256;
+        options.context = 256;
         let backend = Backend::new(&options, 15)?;
         for bits in [4, 8] {
             let matrix = QuantMatrix {
@@ -1256,15 +1267,17 @@ mod tests {
                     .collect(),
                 scales: (0..256).map(|n| 0.002 + (n % 11) as f32 * 0.0001).collect(),
             };
-            let input: Vec<_> = (0..128 * 256)
+            let input: Vec<_> = (0..256 * 256)
                 .map(|i| ((i * 17 + i / 256 * 3) % 127) as f32 / 63.0 - 1.0)
                 .collect();
-            let reference = oracle(&matrix, &input, 128);
+            let reference = oracle(&matrix, &input, 256);
             let linear = backend.load(
                 matrix,
                 Some(Box::new(|| bail!("cache-only path reloaded weights"))),
             )?;
-            for rows in [1, 2, 3, 5, 9, 17, 32, 33, 65, 127, 128] {
+            for rows in [
+                1, 2, 3, 5, 9, 17, 32, 33, 65, 127, 128, 129, 191, 192, 193, 255, 256,
+            ] {
                 let mut output = vec![0.0; rows * 256];
                 linear.run(&input, &mut output, rows)?;
                 compare(&output, &reference[..rows * 256], 2e-5);
