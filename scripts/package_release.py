@@ -34,7 +34,15 @@ def main():
         shutil.copy2(root / "target/release/open_rknpu2_lm_infer", binary / "bin")
         for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock"]:
             shutil.copy2(root / name, binary / name)
-        shutil.copytree(root / "llm_generated_docs", binary / "llm_generated_docs")
+        docs = subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "llm_generated_docs"], cwd=root,
+        ).decode().split("\0")
+        for name in filter(None, docs):
+            destination = binary / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / name, destination)
+        (binary / "scripts").mkdir()
+        shutil.copy2(root / "scripts/run_board.py", binary / "scripts/run_board.py")
         operator = binary / "native/rk_npu_matmul"
         operator.mkdir(parents=True)
         for name in ["LICENSE", "THIRD_PARTY_NOTICES.md"]:

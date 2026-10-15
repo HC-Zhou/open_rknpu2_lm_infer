@@ -19,10 +19,14 @@ def main():
     if output.exists():
         parser.error("output must be a new directory")
     output.mkdir(parents=True)
-    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", ".gitignore", ".gitmodules", "LICENSE", "README.md", "README_zh.md", "AGENTS.md", "THIRD_PARTY_NOTICES.md"]:
-        shutil.copy2(root / name, output / name)
-    for name in ["src", "tests", "llm_generated_docs", "scripts", ".github"]:
-        shutil.copytree(root / name, output / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # Package versioned project files, excluding private/untracked experiments.
+    names = subprocess.check_output(["git", "ls-files", "-z"], cwd=root).decode().split("\0")
+    for name in filter(None, names):
+        if name == "native/rk_npu_matmul":
+            continue
+        destination = output / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / name, destination)
     def git(*arguments):
         subprocess.run(["git", "-C", str(output), *arguments], check=True)
 

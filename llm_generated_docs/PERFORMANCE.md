@@ -21,15 +21,15 @@ pp 从空 KV 开始；decode128 的历史 KV 深度分别为512、1024、4096，
 ```sh
 python3 scripts/run_board.py --wait-lock --report warm-clocks.json -- \
   target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
-  --tune-cache /path/to/model-cache bench --suite contexts \
-  --repetitions 1 --report warm.json
+  --tune-cache /path/to/model-cache tune --batches 1,64 \
+  --report tune.json
 python3 scripts/run_board.py --wait-lock --report measured-clocks.json -- \
   target/release/open_rknpu2_lm_infer --model /path/to/model --ctx-size 8192 \
   --tune-cache /path/to/model-cache bench --suite contexts \
   --repetitions 3 --report measured.json
 ```
 
-正式报告的 `stats.tune_cache_misses` 应为0。最大上下文容量至少4224，以容纳4096-token 历史与128步 decode。Granite 的 W8 8192×2560 down projection 使用2048/4096的 K 分块候选。
+正式报告的 `stats.tune_calls` 与 `stats.strategy_fallback_calls` 应为0。`tune_cache_misses` 可能包含没有选用的 W8 分块候选，不能用它代替实际执行路径的检查。最大上下文容量至少4224，以容纳4096-token 历史与128步 decode。Granite 的 W8 8192×2560 down projection 使用2048/4096的 K 分块候选。
 
 ## 三款模型的前缀 PPL
 

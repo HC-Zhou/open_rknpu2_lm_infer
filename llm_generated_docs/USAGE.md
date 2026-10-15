@@ -12,6 +12,7 @@
 | `chat` | 交互终端（TUI） |
 | `serve` | OpenAI 兼容 HTTP 服务 |
 | `bench` | 测量 prefill 与带历史的 decode |
+| `tune` | 显式搜索缺失的策略，显示进度并保存缓存 |
 | `eval` | 导出固定 token 序列的 FP32 logits |
 | `ppl` | 对独立 token 窗口计算 PPL |
 
@@ -48,7 +49,19 @@ TUI 支持 Enter 发送、Shift+Enter 或 Alt+Enter 换行、Esc 取消生成、
 
 OpenMP 等待默认配置为 `OMP_WAIT_POLICY=PASSIVE`、`GOMP_SPINCOUNT=0`。程序仅补充未设置的变量，保留用户显式设置的值；这些配置在 libgomp 初始化时生效。
 
-首次加载和首次使用新的 batch bucket 会进行调优，结果保存至 `$XDG_CACHE_HOME/open_rknpu2_lm_infer` 或 `~/.cache/open_rknpu2_lm_infer`。`--tune-cache` 指定目录，`--no-tune` 使用确定的默认策略。
+普通推理与评测只读取已有策略；空缓存和新 batch bucket 使用内置回退配置，不进行性能搜索或写缓存。`--tune-cache` 指定目录，默认是 `$XDG_CACHE_HOME/open_rknpu2_lm_infer` 或 `~/.cache/open_rknpu2_lm_infer`。`--no-tune` 跳过缓存并使用内置配置。
+
+需要优化策略时显式运行 `tune`。默认准备 decode 和主 prefill；`--batches` 选择实际长度，会按运行时的2的幂 bucket 准备。支持 `ubatch-size` 1–128；256目前仅在算子实验中测试。
+
+```sh
+python3 scripts/run_board.py --report tune-clocks.json -- \
+  target/release/open_rknpu2_lm_infer --tune-cache /path/to/model-cache \
+  tune --batches 1,4,32,64 --report tune.json
+```
+
+调优反馈写入 stderr，包含 batch、domain、形状编号、缓存命中、候选进度、最佳完整调用耗时和已用时间。终端中的 W4 进度条原地刷新；重定向到文件时保留进度记录。已有有效缓存直接复用。当前仍使用既有完整搜索算法，未增加候选或时间预算。
+
+`run --stats` 和生成日志包含 `tune_calls`、`weight_reload_calls`、`strategy_fallback_calls`、`prepare_ms` 等指标。推理阶段前两项应始终为0；回退次数表示实际执行回退配置的 Linear 调用，与探索W8分块时未命中的候选数量分开统计。
 
 ## HTTP 服务
 

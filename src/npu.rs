@@ -4,7 +4,7 @@ use half::f16;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString},
     ptr,
     rc::Rc,
@@ -125,6 +125,13 @@ fn check(rc: i32, name: &str) -> Result<()> {
     }
     Ok(())
 }
+fn check_cache_miss(rc: i32, name: &str) -> Result<()> {
+    if rc == RK_NPU_ERR_CACHE_MISS {
+        Ok(())
+    } else {
+        check(rc, name)
+    }
+}
 fn bucket(rows: usize) -> Result<usize> {
     ensure!(
         (1..=128).contains(&rows),
@@ -153,6 +160,7 @@ struct AttentionWork {
 struct Material {
     matrix: QuantMatrix,
     reload: Option<Reload>,
+    profile: Option<Handle<rk_npu_w4a8_tuning_profile>>,
 }
 struct BackendInner {
     work: BTreeMap<WorkKey, Work>,
@@ -165,6 +173,10 @@ struct BackendInner {
     domain_id: u32,
     cache_hits: usize,
     cache_misses: usize,
+    tune_calls: usize,
+    fallbacks: BTreeSet<WorkKey>,
+    fallback_calls: usize,
+    weight_reload_calls: usize,
     loaded_w4: usize,
     loaded_w8: usize,
     weight_bytes: u64,
@@ -268,7 +280,7 @@ impl Backend {
                 "cannot create NPU IOMMU domain {domain_id}; nonzero domains require RKNPU driver >= 0.9.0 with IOMMU enabled"
             )
         })?;
-        if !options.tune_cache.as_os_str().is_empty() {
+        if options.tune_search && !options.tune_cache.as_os_str().is_empty() {
             std::fs::create_dir_all(&options.tune_cache)?;
         }
         Ok(Self(Rc::new(RefCell::new(BackendInner {
@@ -282,6 +294,10 @@ impl Backend {
             domain_id,
             cache_hits: 0,
             cache_misses: 0,
+            tune_calls: 0,
+            fallbacks: BTreeSet::new(),
+            fallback_calls: 0,
+            weight_reload_calls: 0,
             loaded_w4: 0,
             loaded_w8: 0,
             weight_bytes: 0,
@@ -309,6 +325,7 @@ impl Backend {
         let mut b = self.0.borrow_mut();
         let mut w4 = None;
         let mut w8 = None;
+        let mut profile = None;
         let kt;
         if matrix.bits == 4 {
             let cfg = rk_npu_i4_weight_config {
@@ -345,6 +362,11 @@ impl Backend {
             )?;
             b.weight_bytes += bytes + matrix.n as u64 * 8;
             b.loaded_w4 += 1;
+            profile = Some(Handle::new(
+                unsafe { rk_npu_w4a8_tuning_profile_from_weights(handle.raw) },
+                rk_npu_w4a8_tuning_profile_free,
+                "W4 tuning profile",
+            )?);
             w4 = Some(handle);
         } else {
             kt = b.w8_partition(matrix.k, matrix.n)?;
@@ -376,10 +398,18 @@ impl Backend {
         }
         let key = (matrix.bits, matrix.k, matrix.n, kt);
         if !b.material.contains_key(&key) {
-            if matrix.bits == 8 || !b.options.tune {
+            if matrix.bits == 8 || !b.options.tune_search {
                 matrix.codes = Vec::new();
             }
-            b.material.insert(key, Material { matrix, reload });
+            let reload = if b.options.tune_search { reload } else { None };
+            b.material.insert(
+                key,
+                Material {
+                    matrix,
+                    reload,
+                    profile,
+                },
+            );
         }
         b.get_work(key, 1)?;
         let material = b.material.get_mut(&key).unwrap();
@@ -474,7 +504,19 @@ impl Backend {
         let m = bucket(rows)?;
         let mut b = self.0.borrow_mut();
         let keys: Vec<_> = b.material.keys().copied().collect();
-        for key in keys {
+        for (index, key) in keys.iter().copied().enumerate() {
+            if b.options.tune_search && !b.work.contains_key(&(key, m)) {
+                eprintln!(
+                    "Tuning shapes {}/{}: domain={} W{} M={m} K={} N={} Ktile={}",
+                    index + 1,
+                    keys.len(),
+                    b.domain_id,
+                    key.0,
+                    key.1,
+                    key.2,
+                    key.3
+                );
+            }
             b.get_work(key, m)?;
         }
         Ok(())
@@ -514,6 +556,9 @@ impl Backend {
             "tuning_material_bytes": material, "workspace_count": b.work.len(),
             "attention_cpu_staging_bytes": staging, "tune_cache_hits": b.cache_hits,
             "tune_cache_misses": b.cache_misses, "npu_core_mask": b.options.npu_mask,
+            "tune_calls": b.tune_calls, "strategy_fallbacks": b.fallbacks.len(),
+            "strategy_fallback_calls": b.fallback_calls, "weight_reload_calls": b.weight_reload_calls,
+            "weight_profile_creations": b.loaded_w4,
             "cpu_core_mask": b.options.cpu_mask, "certified_w4_tiles": true,
             "attention_geometry": b.attention.as_ref().map(|a| json!({
                 "query_heads": a.config.query_heads, "kv_heads": a.config.kv_heads,
@@ -570,6 +615,9 @@ impl BackendInner {
                 let key = (8, k, n, candidate);
                 let decode = self.w8_strategy(key, 1)?;
                 let prefill = self.w8_strategy(key, bucket(self.options.chunk)?)?;
+                if decode.total_us <= 0.0 || prefill.total_us <= 0.0 {
+                    continue;
+                }
                 let cost = 64.0 * decode.total_us
                     + 128usize.div_ceil(self.options.chunk) as f64 * prefill.total_us;
                 if cost < best {
@@ -578,6 +626,10 @@ impl BackendInner {
                 }
             }
         }
+        ensure!(
+            permitted(kt),
+            "no legal W8 K partition for K={k}, M={prefill_rows}"
+        );
         self.w8_partitions.insert((k, n), kt);
         Ok(kt)
     }
@@ -587,6 +639,7 @@ impl BackendInner {
         }
         let (_, k, n, kt) = key;
         let mut fastest = rk_npu_matmul_strategy::default();
+        let mut found = false;
         if self.options.tune {
             let mut cfg = rk_npu_matmul_autotune_config::default();
             unsafe { rk_npu_matmul_autotune_config_init(&mut cfg, m as i32, n as i32, k as i32) };
@@ -597,27 +650,64 @@ impl BackendInner {
             cfg.loops = 3;
             cfg.repeats = 3;
             let mut stable = rk_npu_matmul_strategy::default();
-            let mut hit = 0;
             let path = self.cache_path(key, m)?;
-            tracing::info!(m, k, n, kt, domain = self.domain_id, "prepare W8");
-            check(
+            let rc = if let Some(path) = &path {
                 unsafe {
-                    rk_npu_matmul_autotune_cached(
+                    rk_npu_matmul_autotune_cache_load(
                         self.context.raw,
-                        &cfg,
+                        path.as_ptr(),
                         RK_NPU_MATMUL_F32I8F32_DYNAMIC,
-                        path.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
-                        0,
+                        &cfg,
                         &mut fastest,
                         &mut stable,
-                        &mut hit,
                     )
-                },
-                "W8 tune",
-            )?;
-            self.cache_hits += usize::from(hit != 0);
-            self.cache_misses += usize::from(hit == 0);
-        } else {
+                }
+            } else {
+                RK_NPU_ERR_CACHE_MISS
+            };
+            if rc == 0 {
+                self.cache_hits += 1;
+                found = true;
+            } else {
+                check_cache_miss(rc, "W8 cache load")?;
+                self.cache_misses += 1;
+            }
+            if !found && self.options.tune_search {
+                cfg.verbose = 1;
+                let mut hit = 0;
+                let start = std::time::Instant::now();
+                eprintln!("Tuning W8: M={m} K={k} N={n} Ktile={kt}, cache miss");
+                self.tune_calls += 1;
+                check(
+                    unsafe {
+                        rk_npu_matmul_autotune_cached(
+                            self.context.raw,
+                            &cfg,
+                            RK_NPU_MATMUL_F32I8F32_DYNAMIC,
+                            path.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+                            0,
+                            &mut fastest,
+                            &mut stable,
+                            &mut hit,
+                        )
+                    },
+                    "W8 tune",
+                )?;
+                eprintln!(
+                    "Tuning W8 done: {:.2}s, best={:.1}us",
+                    start.elapsed().as_secs_f64(),
+                    fastest.total_us
+                );
+                found = true;
+            } else if self.options.tune_search {
+                eprintln!(
+                    "Tuning W8: M={m} K={k} N={n} Ktile={kt}, cache hit ({:.1}us)",
+                    fastest.total_us
+                );
+            }
+        }
+        if !found {
+            self.fallbacks.insert((key, m));
             fastest.op_kind = RK_NPU_MATMUL_F32I8F32_DYNAMIC;
             fastest.M = m as i32;
             fastest.N = n as i32;
@@ -642,29 +732,12 @@ impl BackendInner {
         }
         let (_, k, n, kt) = key;
         let mut fastest = rk_npu_w4a8_strategy_ex::default();
+        let mut found = false;
         if self.options.tune {
             let material = self
                 .material
                 .get(&key)
                 .context("missing W4 tuning material")?;
-            let reloaded;
-            let source = if material.matrix.codes.is_empty() {
-                reloaded = material
-                    .reload
-                    .as_ref()
-                    .context("missing W4 tuning weight reload")?()?;
-                ensure!(
-                    reloaded.bits == 4
-                        && reloaded.k == k
-                        && reloaded.n == n
-                        && reloaded.codes.len() == k * n
-                        && reloaded.scales.len() == n,
-                    "tuning weight reload geometry mismatch"
-                );
-                &reloaded
-            } else {
-                &material.matrix
-            };
             let mut cfg = rk_npu_w4a8_autotune_config::default();
             unsafe { rk_npu_w4a8_autotune_config_init(&mut cfg, m as i32, n as i32, k as i32) };
             cfg.required_k_tile = kt as i32;
@@ -675,28 +748,88 @@ impl BackendInner {
             cfg.loops = 3;
             cfg.repeats = 3;
             let mut stable = rk_npu_w4a8_strategy_ex::default();
-            let mut hit = 0;
             let path = self.cache_path(key, m)?;
-            tracing::info!(m, k, n, kt, domain = self.domain_id, "prepare W4");
-            check(
+            let rc = if let Some(path) = &path {
                 unsafe {
-                    rk_npu_w4a8_autotune_cached_ex(
+                    rk_npu_w4a8_autotune_cache_load_profile_ex(
                         self.context.raw,
                         &cfg,
-                        source.codes.as_ptr(),
-                        source.scales.as_ptr(),
-                        path.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
-                        0,
+                        material.profile.as_ref().context("missing W4 profile")?.raw,
+                        path.as_ptr(),
                         &mut fastest,
                         &mut stable,
-                        &mut hit,
                     )
-                },
-                "W4 tune",
-            )?;
-            self.cache_hits += usize::from(hit != 0);
-            self.cache_misses += usize::from(hit == 0);
-        } else {
+                }
+            } else {
+                RK_NPU_ERR_CACHE_MISS
+            };
+            if rc == 0 {
+                self.cache_hits += 1;
+                found = true;
+            } else {
+                check_cache_miss(rc, "W4 cache load")?;
+                self.cache_misses += 1;
+            }
+            if !found && self.options.tune_search {
+                let reloaded;
+                let source = if material.matrix.codes.is_empty() {
+                    self.weight_reload_calls += 1;
+                    reloaded = material
+                        .reload
+                        .as_ref()
+                        .context("missing W4 tuning weight reload")?(
+                    )?;
+                    ensure!(
+                        reloaded.bits == 4
+                            && reloaded.k == k
+                            && reloaded.n == n
+                            && reloaded.codes.len() == k * n
+                            && reloaded.scales.len() == n,
+                        "tuning weight reload geometry mismatch"
+                    );
+                    &reloaded
+                } else {
+                    &material.matrix
+                };
+                cfg.verbose = 2;
+                let mut hit = 0;
+                let start = std::time::Instant::now();
+                eprintln!(
+                    "Tuning W4: domain={} M={m} K={k} N={n} Ktile={kt}, cache miss",
+                    self.domain_id
+                );
+                self.tune_calls += 1;
+                check(
+                    unsafe {
+                        rk_npu_w4a8_autotune_cached_ex(
+                            self.context.raw,
+                            &cfg,
+                            source.codes.as_ptr(),
+                            source.scales.as_ptr(),
+                            path.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+                            0,
+                            &mut fastest,
+                            &mut stable,
+                            &mut hit,
+                        )
+                    },
+                    "W4 tune",
+                )?;
+                eprintln!(
+                    "Tuning W4 done: {:.2}s, best={:.1}us",
+                    start.elapsed().as_secs_f64(),
+                    fastest.base.total_us
+                );
+                found = true;
+            } else if self.options.tune_search {
+                eprintln!(
+                    "Tuning W4: domain={} M={m} K={k} N={n} Ktile={kt}, cache hit ({:.1}us)",
+                    self.domain_id, fastest.base.total_us
+                );
+            }
+        }
+        if !found {
+            self.fallbacks.insert((key, m));
             unsafe {
                 rk_npu_w4a8_config_init(&mut fastest.base.config, m as i32, n as i32, k as i32);
                 rk_npu_w4a8_options_init(&mut fastest.execution);
@@ -837,6 +970,9 @@ impl Linear {
         }
         if m != rows {
             output[..rows * width].copy_from_slice(&work.output[..rows * width]);
+        }
+        if b.fallbacks.contains(&(self.key, m)) {
+            b.fallback_calls += 1;
         }
         Ok(())
     }
@@ -1026,6 +1162,7 @@ mod tests {
             npu_mask: 1,
             cpu_mask: 0,
             tune: false,
+            tune_search: false,
             tune_cache: cache.into(),
             attention_tile: 256,
         };
@@ -1102,7 +1239,9 @@ mod tests {
     fn quantized_linear_padding_and_swiglu() -> Result<()> {
         let _lock = crate::engine::BoardLock::acquire()?;
         let cache = tempfile::tempdir()?;
-        let backend = Backend::new(&options(cache.path())?, 15)?;
+        let mut options = options(cache.path())?;
+        options.tune = true;
+        let backend = Backend::new(&options, 15)?;
         for bits in [4, 8] {
             let matrix = QuantMatrix {
                 bits,
@@ -1117,12 +1256,15 @@ mod tests {
                     .collect(),
                 scales: (0..256).map(|n| 0.002 + (n % 11) as f32 * 0.0001).collect(),
             };
-            let input: Vec<_> = (0..64 * 256)
+            let input: Vec<_> = (0..128 * 256)
                 .map(|i| ((i * 17 + i / 256 * 3) % 127) as f32 / 63.0 - 1.0)
                 .collect();
-            let reference = oracle(&matrix, &input, 64);
-            let linear = backend.load(matrix, None)?;
-            for rows in [1, 3, 32, 33] {
+            let reference = oracle(&matrix, &input, 128);
+            let linear = backend.load(
+                matrix,
+                Some(Box::new(|| bail!("cache-only path reloaded weights"))),
+            )?;
+            for rows in [1, 2, 3, 5, 9, 17, 32, 33, 65, 127, 128] {
                 let mut output = vec![0.0; rows * 256];
                 linear.run(&input, &mut output, rows)?;
                 compare(&output, &reference[..rows * 256], 2e-5);
@@ -1142,6 +1284,14 @@ mod tests {
         }
         backend.retain_workspaces(&[1, 64])?;
         assert_eq!(backend.stats()["workspace_count"], 4);
+        let lookups = backend.tune_operations();
+        backend.prepare(3)?;
+        backend.retain_workspaces(&[1, 64])?;
+        backend.prepare(3)?;
+        assert_eq!(backend.tune_operations(), lookups);
+        assert_eq!(backend.stats()["tune_calls"], 0);
+        assert_eq!(backend.stats()["weight_reload_calls"], 0);
+        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0);
         Ok(())
     }
 

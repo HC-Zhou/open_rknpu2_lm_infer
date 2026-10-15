@@ -57,7 +57,11 @@ pub struct ModelArgs {
     pub cpu_mask: u64,
     #[arg(long, global = true)]
     pub tune_cache: Option<PathBuf>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Use built-in strategies instead of reading the tuning cache"
+    )]
     pub no_tune: bool,
     #[arg(long, global = true, default_value_t = 512)]
     pub attention_tile: usize,
@@ -103,6 +107,7 @@ impl ModelArgs {
             npu_mask: self.npu_mask,
             cpu_mask: self.cpu_mask,
             tune: !self.no_tune,
+            tune_search: false,
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
         })
@@ -196,6 +201,14 @@ pub enum Command {
     /// Benchmark independent pp/tg tests or a consecutive prefill+decode test (-pg).
     #[command(alias = "perf")]
     Bench(BenchArgs),
+    /// Explicitly search missing strategies and save them for later inference.
+    Tune {
+        #[arg(long, value_delimiter = ',', num_args = 1..,
+            help = "Actual prefill lengths to prepare; default: decode and ubatch")]
+        batches: Vec<usize>,
+        #[arg(long, help = "Write final statistics as JSON")]
+        report: Option<PathBuf>,
+    },
 }
 #[derive(Args)]
 pub struct BenchArgs {
@@ -497,6 +510,50 @@ pub async fn execute(cli: Cli) -> Result<()> {
             args.repetitions,
             args.report,
         )?,
+        Command::Tune { batches, report } => {
+            anyhow::ensure!(options.tune, "tune cannot be combined with --no-tune");
+            let mut batches = if batches.is_empty() {
+                vec![1, options.chunk]
+            } else {
+                batches
+            };
+            anyhow::ensure!(
+                batches.iter().all(|&m| m > 0 && m <= options.chunk),
+                "tuning batches must be within 1..ubatch-size"
+            );
+            batches.sort_unstable();
+            batches.dedup();
+            let _lock = crate::engine::BoardLock::acquire()?;
+            let start = std::time::Instant::now();
+            eprintln!(
+                "Tuning: loading model; cache={} (existing entries are reused)",
+                options.tune_cache.display()
+            );
+            let mut options = options;
+            options.tune_search = true;
+            let mut model = crate::model::load(options)?;
+            for (index, &rows) in batches.iter().enumerate() {
+                eprintln!(
+                    "Tuning batch {}/{}: M={rows}, elapsed={:.1}s",
+                    index + 1,
+                    batches.len(),
+                    start.elapsed().as_secs_f64()
+                );
+                model.prepare(rows)?;
+            }
+            let stats = serde_json::json!({"batches":batches,"elapsed_seconds":start.elapsed().as_secs_f64(),"stats":model.stats()});
+            eprintln!(
+                "Tuning complete: {:.1}s; hits={}, searched={}, fallback={}",
+                start.elapsed().as_secs_f64(),
+                stats["stats"]["tune_cache_hits"],
+                stats["stats"]["tune_calls"],
+                stats["stats"]["strategy_fallbacks"]
+            );
+            if let Some(path) = report {
+                std::fs::write(path, serde_json::to_vec_pretty(&stats)?)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
         Command::Eval {
             tokens_file,
             continuation_file,

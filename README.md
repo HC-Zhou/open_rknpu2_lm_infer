@@ -88,6 +88,30 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
 
+## Getting full tuned performance
+
+Inference reads existing tuning results and uses built-in strategies for missing entries. It **does not tune automatically**, including on the first request. Run the explicit preparation below once per model and resource configuration to reach tuned throughput and cover short chat tails. The first run can take several minutes; progress and the best candidate time are shown, and valid cache entries are reused on later runs.
+
+The release archive includes `scripts/run_board.py`. It holds the shared NPU lock, fixes CPU/NPU/DDR clocks for the command, and restores them on exit. Run on the RK3588 board with working `sudo` access:
+
+```sh
+export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub64"
+sudo -v
+python3 scripts/run_board.py --report tune-clocks.json -- \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" tune --batches 1,2,4,8,16,32,64 --report tune.json
+python3 scripts/run_board.py --report bench-clocks.json -- \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
+./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" chat
+```
+
+For a source build, replace `./bin/open_rknpu2_lm_infer` with `target/release/open_rknpu2_lm_infer`. Use the same model, context, batch size, CPU/NPU settings and cache directory when starting `chat` or `serve`. Keep separate cache directories for different models. For throughput-only preparation at batch64, `tune --batches 1,64` is sufficient; the other batches cover irregular chat tails. Batch128 is also supported: set `--ubatch-size 128` consistently and add 128 to `--batches`.
+
+In a fully prepared benchmark, `stats.tune_calls`, `stats.weight_reload_calls` and `stats.strategy_fallback_calls` should all be 0. `tune_cache_misses` can include unused W8 partition candidates, so it is not a substitute for these checks. Both clock reports should have `exit_code: 0` and an empty `restore_errors` list. Empty-cache inference remains usable, but its built-in strategies may not reach the tabled performance. See [usage](llm_generated_docs/USAGE.md) and [performance protocol](llm_generated_docs/PERFORMANCE.md).
+
 ## Architecture
 
 ```
@@ -124,7 +148,7 @@ Set the model directory, then run:
 export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 
 # Single streaming generation
-target/release/open_rknpu2_lm_infer run 'Hello, please introduce yourself.' --chat-template -n 128
+target/release/open_rknpu2_lm_infer run 'Hello, please introduce yourself.' --conversation -n 128
 # Terminal chat
 target/release/open_rknpu2_lm_infer chat
 # OpenAI-compatible server

@@ -16,7 +16,7 @@ def main():
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--mode",choices=["short","representative"],default="short")
     parser.add_argument("--repetitions",type=int,default=3)
-    parser.add_argument("--reuse-cache",action="store_true",help="use already prepared per-program caches; measured runs still require zero misses")
+    parser.add_argument("--reuse-cache",action="store_true",help="use already prepared per-program caches; measured calls still require cached strategies")
     args=parser.parse_args()
     args.output.mkdir(parents=True,exist_ok=True)
     scripts=Path(__file__).resolve().parent
@@ -37,6 +37,10 @@ def main():
             command=[str(args.native_bin),"perf","--model",str(args.model),"--context","4096","--chunk","64",*common,"-b",str(logical_batch),"-r",str(repetitions)]
             command += ["--suite","representative"] if args.mode=="representative" else ["-p","512","-n","128"]
         else:
+            if not measured_run:
+                tune_command=[str(args.rust_bin),"tune","--model",str(args.model),"--ctx-size","4096","--ubatch-size","64","--threads","4","--cpu-mask","0xf0","--npu-mask","7","--attention-tile","512","--tune-cache",str(caches[kind]),"--report",str(args.output/f"{label}-tune.json")]
+                with (args.output/f"{label}-tune.log").open("w") as log:
+                    subprocess.run([sys.executable,str(scripts/"run_board.py"),"--wait-lock","--report",str(args.output/f"{label}-tune-clocks.json"),"--",*tune_command],stdout=log,stderr=subprocess.STDOUT,check=True)
             command=[str(args.rust_bin),"bench","--model",str(args.model),"--ctx-size","4096","--ubatch-size","64",*common,"--repetitions",str(repetitions)]
             command += ["--suite","representative"] if args.mode=="representative" else ["-p","512","-n","128"]
         print(label,flush=True)
@@ -47,11 +51,13 @@ def main():
         if measured_run:
             value=json.loads(report.read_text())
             stats=value["stats"] if kind=="rust" else value
-            if stats["tune_cache_misses"]: raise SystemExit(f"{label}: tuning cache changed")
+            if kind=="rust":
+                if stats["tune_calls"] or stats["strategy_fallback_calls"]: raise SystemExit(f"{label}: measured calls require cached strategies")
+            elif stats["tune_cache_misses"]: raise SystemExit(f"{label}: tuning cache changed")
             reports[kind].append(report)
             clocks.append(str(clock))
     subprocess.run([sys.executable,str(scripts/"compare_perf.py"),"--native",*[str(p) for p in reports["native"]],"--rust",*[str(p) for p in reports["rust"]],"--report",str(args.output/f"{args.mode}-comparison.json")],check=True)
-    (args.output/f"{args.mode}-protocol.json").write_text(json.dumps({"order":order,"model":str(args.model),"context":4096,"chunk":64,"threads":4,"npu_mask":7,"cpu_mask":"0xf0","native_logical_batch":4096 if args.mode=="representative" else 512,"prefill_head_calls_per_run":1,"caches":{key:str(value) for key,value in caches.items()},"warmup_processes":0 if args.reuse_cache else 2,"required_tune_cache_misses":0,"clocks":clocks},indent=2)+"\n")
+    (args.output/f"{args.mode}-protocol.json").write_text(json.dumps({"order":order,"model":str(args.model),"context":4096,"chunk":64,"threads":4,"npu_mask":7,"cpu_mask":"0xf0","native_logical_batch":4096 if args.mode=="representative" else 512,"prefill_head_calls_per_run":1,"caches":{key:str(value) for key,value in caches.items()},"warmup_processes":0 if args.reuse_cache else 2,"required_native_tune_cache_misses":0,"required_tune_calls":0,"required_strategy_fallback_calls":0,"tuning_processes":0 if args.reuse_cache else 1,"clocks":clocks},indent=2)+"\n")
 
 
 if __name__=="__main__":

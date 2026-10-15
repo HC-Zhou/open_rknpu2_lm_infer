@@ -896,6 +896,11 @@ impl LanguageModel for Dense {
             "workspace_count",
             "tune_cache_hits",
             "tune_cache_misses",
+            "tune_calls",
+            "strategy_fallbacks",
+            "strategy_fallback_calls",
+            "weight_reload_calls",
+            "weight_profile_creations",
             "attention_cpu_staging_bytes",
         ] {
             result[key] = json!(
@@ -964,6 +969,7 @@ impl LanguageModel for Dense {
         result["cpu_ms"] = json!(self.timings.cpu);
         result["head_ms"] = json!(self.timings.head);
         result["tuning_enabled"] = json!(self.options.tune);
+        result["tuning_search_enabled"] = json!(self.options.tune_search);
         result["tune_cache"] = json!(self.options.tune_cache);
         result
     }

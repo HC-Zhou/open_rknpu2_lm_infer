@@ -11,12 +11,12 @@ Release CI 由 v 开头的 tag 触发，复用同一套检查和构建。tag 必
 
 | 附件 | 内容 |
 |---|---|
-| open_rknpu2_lm_infer-vVERSION-linux-aarch64.tar.gz | ARM64 可执行程序、使用文档、工程和第三方许可证 |
+| open_rknpu2_lm_infer-vVERSION-linux-aarch64.tar.gz | ARM64 可执行程序、使用文档、固定频率脚本、工程和第三方许可证 |
 | open_rknpu2_lm_infer-vVERSION-source.tar.gz | Rust 源码、CI 定义及从上游初始化的固定算子库 submodule |
 
 二进制使用 glibc 2.31 构建，适用于 Debian 11 或更新的 ARM64 Linux。系统需要 libstdc++6、libgomp1 和可用的 RK3588 NPU DRM 驱动。解压后通过 bin/open_rknpu2_lm_infer 运行。
 
-源码包保留 submodule 的 Git 元数据和固定提交，可直接执行 cargo build --release --locked。依赖仍由上游仓库维护。
+源码包保留 submodule 的 Git 元数据和固定提交，可直接执行 cargo build --release --locked。依赖仍由上游仓库维护。源码与文档只收录Git跟踪的文件，本地未跟踪实验不进入附件；二进制附件包含scripts/run_board.py，以便按README显式调优和固定频率测速。
 
 ## 板端验证
 

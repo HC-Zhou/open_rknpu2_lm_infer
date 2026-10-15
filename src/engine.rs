@@ -129,7 +129,11 @@ impl Engine {
             .spawn(move || {
                 let loaded = (|| -> Result<_> {
                     let lock = BoardLock::acquire()?;
-                    let model = model::load(options)?;
+                    let chunk = options.chunk;
+                    let mut options = options;
+                    options.tune_search = false;
+                    let mut model = model::load(options)?;
+                    model.prepare(chunk)?;
                     Ok((lock, model))
                 })();
                 let (_lock, mut model) = match loaded {
@@ -412,6 +416,15 @@ fn run_generation(
             "generation_ms":start.elapsed().as_secs_f64()*1000.0}),
         stats: model.stats(),
     };
+    tracing::info!(prompt_tokens = result.prompt_tokens, cached_tokens = result.cached_tokens,
+        completion_tokens = result.completion_tokens, timings = %result.timings,
+        tune_cache_hits = %result.stats["tune_cache_hits"],
+        tune_cache_misses = %result.stats["tune_cache_misses"],
+        tune_calls = %result.stats["tune_calls"],
+        weight_reload_calls = %result.stats["weight_reload_calls"],
+        weight_profile_creations = %result.stats["weight_profile_creations"],
+        strategy_fallback_calls = %result.stats["strategy_fallback_calls"],
+        strategy_fallbacks = %result.stats["strategy_fallbacks"], "generation finished");
     send_event(job, GenerationEvent::Finished(result))
 }
 

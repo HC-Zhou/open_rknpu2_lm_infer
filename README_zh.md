@@ -88,6 +88,30 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
 
+## 跑出完整调优性能
+
+推理只读取已有调优结果，缺失时使用内置策略，**首次请求也不会自动调优**。要获得调优后的吞吐并覆盖聊天尾块，请针对模型和资源配置显式准备一次。首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
+
+Release附件已包含 `scripts/run_board.py`。它持有共享NPU锁，为命令固定CPU/NPU/DDR频率，并在退出时恢复。在具有可用sudo权限的RK3588板上运行：
+
+```sh
+export RKNPU_MODEL=models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_TUNE_CACHE="$HOME/.cache/open_rknpu2_lm_infer/qwen3-4b-ub64"
+sudo -v
+python3 scripts/run_board.py --report tune-clocks.json -- \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" tune --batches 1,2,4,8,16,32,64 --report tune.json
+python3 scripts/run_board.py --report bench-clocks.json -- \
+  ./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" bench --suite contexts --repetitions 3 --report bench.json
+./bin/open_rknpu2_lm_infer --ctx-size 8192 --ubatch-size 64 \
+  --tune-cache "$RKNPU_TUNE_CACHE" chat
+```
+
+源码构建时，将 `./bin/open_rknpu2_lm_infer` 替换为 `target/release/open_rknpu2_lm_infer`。启动 `chat` 或 `serve` 时保持模型、上下文、ubatch、CPU/NPU配置和缓存目录一致；不同模型使用独立目录。若只准备batch64的吞吐测速，`tune --batches 1,64`即可，其余档位用于不规则聊天尾块。也支持128：各处统一设置 `--ubatch-size 128`，并在调优列表中加入128。
+
+完整准备后的benchmark应满足 `stats.tune_calls`、`stats.weight_reload_calls`、`stats.strategy_fallback_calls`全为0。`tune_cache_misses`可能包含未采用的W8分块候选，不能代替实际执行计数。两个频率报告应显示 `exit_code: 0`、`restore_errors: []`。空缓存可以直接推理，但内置策略不保证达到表中的峰值性能。详见[使用说明](llm_generated_docs/USAGE.md)和[测速口径](llm_generated_docs/PERFORMANCE.md)。
+
 ## 架构
 
 ```
@@ -124,7 +148,7 @@ cargo build --release --locked
 export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 
 # 单次流式生成
-target/release/open_rknpu2_lm_infer run '你好，请介绍一下自己。' --chat-template -n 128
+target/release/open_rknpu2_lm_infer run '你好，请介绍一下自己。' --conversation -n 128
 # 终端聊天
 target/release/open_rknpu2_lm_infer chat
 # OpenAI 兼容服务

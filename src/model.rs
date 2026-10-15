@@ -14,6 +14,8 @@ pub struct ModelOptions {
     pub npu_mask: u32,
     pub cpu_mask: u64,
     pub tune: bool,
+    /// Permit device search only in the explicit tuning command.
+    pub tune_search: bool,
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
 }
