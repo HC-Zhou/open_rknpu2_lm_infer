@@ -44,7 +44,7 @@ fn full_head_neon_and_scalar_tail_match_across_window_lengths_and_decay() {
     let mut workspace = Workspace::default();
     for (kh, vh, kd, vd) in [(2, 4, 128, 128), (3, 3, 7, 5), (1, 2, 4, 3)] {
         let dim = GdnDimensions::new(kh, vh, kd, vd).unwrap();
-        for rows in [1, 2, 3, 4, 5, 7, 8, 31, 32, 33, 127, 128, 129] {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 9, 31, 32, 33, 127, 128, 129] {
             let mut q = series(rows * dim.key_width(), 1, 1.0);
             let mut k = series(q.len(), 9, 1.0);
             norm::l2_normalize(&mut q, kd).unwrap();
@@ -82,6 +82,59 @@ fn full_head_neon_and_scalar_tail_match_across_window_lengths_and_decay() {
             close(&b, &a);
             close(&parallel, &scalar);
         }
+    }
+}
+
+#[test]
+fn short_windows_match_reference_for_copied_in_place_and_replayed_state() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let dim = GdnDimensions::new(2, 4, 128, 8).unwrap();
+    for rows in 1..=9 {
+        let mut q = series(rows * dim.key_width(), 1, 1.0);
+        let mut k = series(q.len(), 9, 1.0);
+        norm::l2_normalize(&mut q, 128).unwrap();
+        norm::l2_normalize(&mut k, 128).unwrap();
+        let value = series(rows * dim.value_width(), 19, 0.3);
+        let log_decay: Vec<_> = (0..rows * dim.value_heads())
+            .map(|i| [0.0, -1e-6, -0.07, -90.0, f32::NEG_INFINITY][i % 5])
+            .collect();
+        let beta: Vec<_> = (0..log_decay.len())
+            .map(|i| [0.0, 1.0, 0.37][i % 3])
+            .collect();
+        let updates = Updates {
+            rows,
+            key: &k,
+            value: &value,
+            log_decay: &log_decay,
+            beta: &beta,
+        };
+        let initial = series(dim.state_elements(), 29, 0.01);
+        let source = initial.clone();
+        let mut expected_state = initial.clone();
+        let mut expected = vec![0.0; value.len()];
+        Workspace::ggml_loop_reference()
+            .run(&pool, dim, &mut expected_state, &q, updates, &mut expected)
+            .unwrap();
+        let mut state = vec![123.0; initial.len()];
+        let mut output = expected.clone();
+        Workspace::default()
+            .run_from(&pool, dim, &initial, &mut state, &q, updates, &mut output)
+            .unwrap();
+        assert_eq!(initial, source);
+        assert_eq!(state, expected_state);
+        assert_eq!(output, expected);
+        state.clone_from(&initial);
+        Workspace::default()
+            .run(&pool, dim, &mut state, &q, updates, &mut output)
+            .unwrap();
+        assert_eq!(state, expected_state);
+        assert_eq!(output, expected);
+        state.clone_from(&initial);
+        gdn::replay(&pool, dim, &mut state, updates).unwrap();
+        assert_eq!(state, expected_state);
     }
 }
 

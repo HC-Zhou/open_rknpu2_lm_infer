@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use rayon::ThreadPool;
 use serde::Serialize;
 
-use super::mixer::{MixerWeights, MixerWorkspace, Projected};
+use super::mixer::{MixerWeights, MixerWorkspace, Projected, ValidatedProjected};
 use crate::ops::{
     causal_conv::ConvState,
     gated_delta::{self, GdnDimensions, Updates},
@@ -134,6 +134,28 @@ impl LayerState {
         }
     }
 
+    fn prepare<'a>(
+        &self,
+        weights: &MixerWeights,
+        input: Projected<'a>,
+        scratch: &mut Scratch,
+    ) -> Result<ValidatedProjected<'a>> {
+        ensure!(
+            weights.dim == self.dim && weights.kernel == self.kernel,
+            "GDN state/weight mismatch"
+        );
+        let checked = input.validate(self.dim)?;
+        ensure!(
+            self.position.checked_add(input.rows).is_some(),
+            "GDN position overflow"
+        );
+        match scratch.conv.as_mut() {
+            Some(conv) => conv.clone_from(&self.conv),
+            None => scratch.conv = Some(self.conv.clone()),
+        }
+        Ok(checked)
+    }
+
     fn compute<'a>(
         &self,
         pool: &ThreadPool,
@@ -141,34 +163,21 @@ impl LayerState {
         input: Projected<'_>,
         scratch: &'a mut Scratch,
     ) -> Result<&'a [f32]> {
-        ensure!(
-            weights.dim == self.dim && weights.kernel == self.kernel,
-            "GDN state/weight mismatch"
-        );
-        input.validate(self.dim)?;
-        ensure!(
-            self.position.checked_add(input.rows).is_some(),
-            "GDN position overflow"
-        );
-        // The recurrence's C++ workers copy each canonical head directly into
-        // scratch before computing it. Avoid a serial 2 MiB copy per layer.
+        let checked = self.prepare(weights, input, scratch)?;
         scratch.state.resize(self.state.len(), 0.0);
-        match scratch.conv.as_mut() {
-            Some(conv) => conv.clone_from(&self.conv),
-            None => scratch.conv = Some(self.conv.clone()),
-        }
         scratch.mixer.run(
             pool,
             weights,
-            input,
-            &self.state,
+            checked,
+            Some(&self.state),
             &mut scratch.state,
             scratch.conv.as_mut().unwrap(),
         )?;
         Ok(scratch.mixer.output())
     }
 
-    /// Normal prefill/decode consumes every real row, with no retained log.
+    /// Normal prefill/decode updates canonical state in place. Verification
+    /// keeps the separate working state; ordinary forward retains no log.
     pub fn forward<'a>(
         &mut self,
         pool: &ThreadPool,
@@ -180,8 +189,15 @@ impl LayerState {
             self.pending.is_none(),
             "GDN verification transaction is active"
         );
-        self.compute(pool, weights, input, scratch)?;
-        std::mem::swap(&mut self.state, &mut scratch.state);
+        let checked = self.prepare(weights, input, scratch)?;
+        scratch.mixer.run(
+            pool,
+            weights,
+            checked,
+            None,
+            &mut self.state,
+            scratch.conv.as_mut().unwrap(),
+        )?;
         std::mem::swap(&mut self.conv, scratch.conv.as_mut().unwrap());
         self.position += input.rows;
         Ok(scratch.mixer.output())

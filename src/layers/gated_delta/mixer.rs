@@ -71,8 +71,11 @@ pub struct Projected<'a> {
     pub b: &'a [f32],
 }
 
-impl Projected<'_> {
-    pub(super) fn validate(self, dim: GdnDimensions) -> Result<()> {
+/// The layer checked projection shapes/values before touching canonical state.
+pub(super) struct ValidatedProjected<'a>(Projected<'a>);
+
+impl<'a> Projected<'a> {
+    pub(super) fn validate(self, dim: GdnDimensions) -> Result<ValidatedProjected<'a>> {
         ensure!(
             self.rows > 0
                 && self.rows.checked_mul(dim.conv_width()) == Some(self.qkv.len())
@@ -90,7 +93,7 @@ impl Projected<'_> {
                 .all(|v| v.is_finite()),
             "nonfinite GDN projected input"
         );
-        Ok(())
+        Ok(ValidatedProjected(self))
     }
 }
 
@@ -133,13 +136,13 @@ impl MixerWorkspace {
         &mut self,
         pool: &ThreadPool,
         weights: &MixerWeights,
-        input: Projected<'_>,
-        initial_state: &[f32],
+        input: ValidatedProjected<'_>,
+        initial_state: Option<&[f32]>,
         state: &mut [f32],
         conv: &mut ConvState,
     ) -> Result<()> {
         let dim = weights.dim;
-        input.validate(dim)?;
+        let input = input.0;
         self.convolved.resize(input.qkv.len(), 0.0);
         conv.run_parallel(pool, input.qkv, &weights.conv, &mut self.convolved)?;
         self.query.resize(input.rows * dim.key_width(), 0.0);
@@ -164,21 +167,29 @@ impl MixerWorkspace {
             self.beta[i] = activation::sigmoid(input.b[i]);
         }
         self.core.resize(input.rows * dim.value_width(), 0.0);
-        self.recurrence.run_from(
-            pool,
-            dim,
-            initial_state,
-            state,
-            &self.query,
-            Updates {
-                rows: input.rows,
-                key: &self.key,
-                value: &self.value,
-                log_decay: &self.log_decay,
-                beta: &self.beta,
-            },
-            &mut self.core,
-        )?;
+        let updates = Updates {
+            rows: input.rows,
+            key: &self.key,
+            value: &self.value,
+            log_decay: &self.log_decay,
+            beta: &self.beta,
+        };
+        // All input/update checks finish before the native call mutates state.
+        // Output norm's shapes/epsilon follow from MixerWeights and these buffers.
+        match initial_state {
+            Some(initial) => self.recurrence.run_from(
+                pool,
+                dim,
+                initial,
+                state,
+                &self.query,
+                updates,
+                &mut self.core,
+            )?,
+            None => self
+                .recurrence
+                .run(pool, dim, state, &self.query, updates, &mut self.core)?,
+        }
         self.output.resize(self.core.len(), 0.0);
         norm::gated_norm_parallel(
             pool,

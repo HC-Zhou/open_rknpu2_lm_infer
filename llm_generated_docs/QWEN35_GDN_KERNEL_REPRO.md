@@ -14,6 +14,8 @@
 
 当前主线代码已按通用算子/层重组；上述路径是新的维护入口。证据目录中的 `reference_cpu/`、`reference_runner/`、manifest 及11个NPZ保持原始快照和哈希，其中旧 C ABI 名称 `qwen35_gdn_*` 仍可独立编译。新主线 ABI 为 `rknpu2_gdn_*`，状态/输入/输出布局不变。
 
+后续 CPU M≤8 优化见 [QWEN35_GDN_SMALL_BATCH_CPU_OPTIMIZATION.md](QWEN35_GDN_SMALL_BATCH_CPU_OPTIMIZATION.md)：普通 forward 原地更新，verify 保留工作副本，短窗口独立分块。这里的oracle包及历史单层基线保持原始快照，NPU对接的C ABI和FP32布局保持一致。
+
 ## 数学与布局
 
 固定 C7 形状 `Hk=16, Hv=32, Dk=Dv=128`，所有数组均为 C contiguous、little-endian FP32：

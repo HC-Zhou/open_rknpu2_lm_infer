@@ -5,6 +5,7 @@
 #include "gdn.h"
 #include "vec.h"
 #include "block.h"
+#include "small_batch.h"
 #include <cstring>
 #include <vector>
 
@@ -67,6 +68,14 @@ void run(const rknpu2_gdn_params & p) {
 } // namespace
 
 extern "C" void rknpu2_gdn_run(const rknpu2_gdn_params * p) {
+#if defined(__aarch64__)
+    // One worker does not benefit from the short-window loop interchange.
+    if (p->threads > 1 && p->rows >= 1 && p->rows <= 8 && p->key_dim == 128 && p->value_dim % 4 == 0) {
+        if (p->output) rknpu2_cpu_kernels::run_small_batch<true>(*p);
+        else rknpu2_cpu_kernels::run_small_batch<false>(*p);
+        return;
+    }
+#endif
     if (p->output) run<true, true>(*p);
     else run<true, false>(*p);
 }

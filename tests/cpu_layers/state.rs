@@ -37,7 +37,12 @@ fn complete_cpu_mixer_matches_pinned_transformers_fixture() {
 
 #[test]
 fn prefill_chunks_and_single_token_execution_have_identical_states_and_outputs() {
-    let dim = GdnDimensions::new(2, 4, 8, 5).unwrap();
+    for (kd, vd) in [(8, 5), (128, 8)] {
+        check_chunks(GdnDimensions::new(2, 4, kd, vd).unwrap());
+    }
+}
+
+fn check_chunks(dim: GdnDimensions) {
     let weights = weights(dim, 4, 3);
     let input = Inputs::new(dim, 129, 7);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -73,7 +78,12 @@ fn prefill_chunks_and_single_token_execution_have_identical_states_and_outputs()
 
 #[test]
 fn every_acceptance_boundary_replays_only_confirmed_prefix_and_next_call_matches_recompute() {
-    let dim = GdnDimensions::new(2, 4, 8, 5).unwrap();
+    for (kd, vd) in [(8, 5), (128, 8)] {
+        check_acceptance(GdnDimensions::new(2, 4, kd, vd).unwrap());
+    }
+}
+
+fn check_acceptance(dim: GdnDimensions) {
     let weights = weights(dim, 4, 13);
     let input = Inputs::new(dim, 64, 31);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -115,6 +125,55 @@ fn every_acceptance_boundary_replays_only_confirmed_prefix_and_next_call_matches
             assert_eq!(state.canonical(), fresh.canonical());
         }
     }
+}
+
+#[test]
+fn failed_forward_preserves_state_history_and_position_after_preprocessing() {
+    let dim = GdnDimensions::new(2, 4, 128, 8).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let good_weights = weights(dim, 4, 3);
+    let good_input = Inputs::new(dim, 2, 7);
+    let mut state = LayerState::new(dim, 4, 8).unwrap();
+    let mut scratch = Scratch::default();
+    state
+        .forward(&pool, &good_weights, good_input.view(0, 1), &mut scratch)
+        .unwrap();
+    let before = state.canonical().to_vec();
+    let history = state.convolution().to_vec();
+    let bad_weights = MixerWeights::new(
+        dim,
+        4,
+        vec![0.1; dim.conv_width() * 4],
+        vec![-1000.0; dim.value_heads()],
+        vec![f32::MAX; dim.value_heads()],
+        vec![1.0; dim.value_dim()],
+        1e-6,
+    )
+    .unwrap();
+    let mut bad_input = Inputs::new(dim, 1, 7);
+    bad_input.a.fill(f32::MAX);
+    // Finite inputs pass validation, but 0 * softplus(MAX + MAX) is NaN.
+    // The recurrence rejects it after convolution, before canonical mutation.
+    assert!(
+        state
+            .forward(&pool, &bad_weights, bad_input.view(0, 1), &mut scratch)
+            .is_err()
+    );
+    assert_eq!(state.canonical(), before);
+    assert_eq!(state.convolution(), history);
+    assert_eq!(state.position(), 1);
+    state
+        .forward(&pool, &good_weights, good_input.view(1, 1), &mut scratch)
+        .unwrap();
+    let mut fresh = LayerState::new(dim, 4, 8).unwrap();
+    fresh
+        .forward(&pool, &good_weights, good_input.view(0, 2), &mut scratch)
+        .unwrap();
+    assert_eq!(state.canonical(), fresh.canonical());
+    assert_eq!(state.convolution(), fresh.convolution());
 }
 
 #[test]
