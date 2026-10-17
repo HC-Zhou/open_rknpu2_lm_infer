@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.14)
+project(rknpu2_cpu_kernels LANGUAGES CXX)
+find_package(OpenMP REQUIRED)
+add_library(rknpu2_cpu_kernels STATIC gdn.cpp)
+target_compile_features(rknpu2_cpu_kernels PRIVATE cxx_std_17)
+target_compile_options(rknpu2_cpu_kernels PRIVATE -Wall -Wextra -Werror)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    # RK3588 big cores. Scheduling only: no extra ISA requirements or fast-math.
+    target_compile_options(rknpu2_cpu_kernels PRIVATE -mtune=cortex-a76)
+endif()
+target_link_libraries(rknpu2_cpu_kernels PRIVATE OpenMP::OpenMP_CXX)
+set_target_properties(rknpu2_cpu_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)

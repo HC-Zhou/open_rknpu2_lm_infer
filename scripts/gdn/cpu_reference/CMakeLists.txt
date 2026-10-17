@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.14)
+project(rknpu2_gdn_kernel_reference LANGUAGES CXX)
+set(CPU_MODULE "${CMAKE_CURRENT_LIST_DIR}/../../../native/cpu_kernels")
+add_subdirectory("${CPU_MODULE}" cpu-kernels)
+add_executable(gdn_kernel_runner main.cpp)
+target_compile_features(gdn_kernel_runner PRIVATE cxx_std_17)
+target_include_directories(gdn_kernel_runner PRIVATE "${CPU_MODULE}")
+target_link_libraries(gdn_kernel_runner PRIVATE rknpu2_cpu_kernels)

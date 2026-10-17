@@ -19,6 +19,19 @@ fn main() {
         .define("RK_NPU_ENABLE_TRACE", "OFF")
         .build_target("rk_npu_matmul_static")
         .build();
+    let cpu_root =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("native/cpu_kernels");
+    println!("cargo:rerun-if-changed={}", cpu_root.display());
+    let cpu_output = cmake::Config::new(cpu_root)
+        .out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
+        .profile("Release")
+        .build_target("rknpu2_cpu_kernels")
+        .build();
+    println!(
+        "cargo:rustc-link-search=native={}",
+        cpu_output.join("build").display()
+    );
+    println!("cargo:rustc-link-lib=static=rknpu2_cpu_kernels");
     println!(
         "cargo:rustc-link-search=native={}",
         output.join("build").display()

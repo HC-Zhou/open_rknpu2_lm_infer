@@ -89,10 +89,7 @@ impl ModelArgs {
         let context = if self.context == 0 {
             let config: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-            config["max_position_embeddings"]
-                .as_u64()
-                .context("--ctx-size 0 requires max_position_embeddings in config.json")?
-                .min(32768) as usize
+            crate::model::metadata::context_limit(&config)?
         } else {
             self.context
         };
@@ -402,19 +399,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
     let options = model_args.options()?;
     match cli.command {
         Command::Inspect => {
-            let config: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
-            let tokenizer_config = options.path.join("tokenizer_config.json");
-            let tokenizer: serde_json::Value = if tokenizer_config.exists() {
-                serde_json::from_slice(&std::fs::read(tokenizer_config)?)?
-            } else {
-                serde_json::Value::Null
-            };
             println!(
                 "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({"path":options.path,"model_type":config["model_type"],"architectures":config["architectures"],"layers":config["num_hidden_layers"],"hidden_size":config["hidden_size"],"attention_heads":config["num_attention_heads"],"kv_heads":config["num_key_value_heads"],"vocab_size":config["vocab_size"],"max_position_embeddings":config["max_position_embeddings"],"quantization_config":config["quantization_config"],"chat_template":options.path.join("chat_template.jinja").exists() || tokenizer.get("chat_template").is_some(),"requested_context":options.context})
-                )?
+                serde_json::to_string_pretty(&crate::model::metadata::inspect(
+                    &options.path,
+                    options.context
+                )?)?
             );
         }
         Command::Tokenize {

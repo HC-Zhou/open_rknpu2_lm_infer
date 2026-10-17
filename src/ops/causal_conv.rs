@@ -1,0 +1,114 @@
+//! Stateful depthwise causal convolution followed by SiLU.
+use super::activation::silu;
+use anyhow::{Context, Result, ensure};
+use rayon::{ThreadPool, prelude::*};
+
+mod kernel;
+
+/// Channel-major, oldest-to-newest K-1 samples. K=1 has empty history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvState {
+    channels: usize,
+    kernel: usize,
+    history: Vec<f32>,
+}
+
+impl ConvState {
+    pub fn new(channels: usize, kernel: usize) -> Result<Self> {
+        ensure!(channels > 0 && kernel > 0, "invalid convolution dimensions");
+        let elements = channels
+            .checked_mul(kernel - 1)
+            .context("convolution size overflow")?;
+        Ok(Self {
+            channels,
+            kernel,
+            history: vec![0.0; elements],
+        })
+    }
+    pub fn history(&self) -> &[f32] {
+        &self.history
+    }
+    pub fn reset(&mut self) {
+        self.history.fill(0.0);
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        self.history.capacity() * 4
+    }
+
+    pub fn run(&mut self, input: &[f32], weights: &[f32], output: &mut [f32]) -> Result<()> {
+        ensure!(
+            input.len().is_multiple_of(self.channels)
+                && input.len() == output.len()
+                && self.channels.checked_mul(self.kernel) == Some(weights.len()),
+            "convolution shape mismatch"
+        );
+        for (input, output) in input
+            .chunks(self.channels)
+            .zip(output.chunks_mut(self.channels))
+        {
+            for c in 0..self.channels {
+                let base = c * (self.kernel - 1);
+                let history = &self.history[base..base + self.kernel - 1];
+                let weight = &weights[c * self.kernel..(c + 1) * self.kernel];
+                let mut value = history.iter().zip(weight).map(|(x, w)| x * w).sum::<f32>();
+                value += input[c] * weight[self.kernel - 1];
+                output[c] = silu(value);
+            }
+            self.append_row(input);
+        }
+        Ok(())
+    }
+
+    /// Tokens read their causal window directly from input plus the old history.
+    /// No per-token history moves or scalar SiLU calls in the batch path.
+    pub fn run_parallel(
+        &mut self,
+        pool: &ThreadPool,
+        input: &[f32],
+        weights: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            input.len().is_multiple_of(self.channels)
+                && input.len() == output.len()
+                && self.channels.checked_mul(self.kernel) == Some(weights.len()),
+            "convolution shape mismatch"
+        );
+        pool.install(|| {
+            output
+                .par_chunks_mut(self.channels)
+                .enumerate()
+                .for_each(|(t, out)| kernel::row(self, input, weights, t, out));
+        });
+        self.append(input)
+    }
+
+    fn append_row(&mut self, row: &[f32]) {
+        if self.kernel == 1 {
+            return;
+        }
+        for (c, history) in self.history.chunks_mut(self.kernel - 1).enumerate() {
+            history.copy_within(1.., 0);
+            history[self.kernel - 2] = row[c];
+        }
+    }
+
+    pub fn append(&mut self, input: &[f32]) -> Result<()> {
+        ensure!(
+            input.len().is_multiple_of(self.channels),
+            "convolution replay shape mismatch"
+        );
+        if self.kernel == 1 || input.is_empty() {
+            return Ok(());
+        }
+        let rows = input.len() / self.channels;
+        let keep = rows.min(self.kernel - 1);
+        for (c, history) in self.history.chunks_mut(self.kernel - 1).enumerate() {
+            history.copy_within(keep.., 0);
+            for (j, value) in history[self.kernel - 1 - keep..].iter_mut().enumerate() {
+                *value = input[(rows - keep + j) * self.channels + c];
+            }
+        }
+        Ok(())
+    }
+}

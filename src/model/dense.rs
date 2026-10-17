@@ -1,109 +1,22 @@
 use super::{
     LanguageModel, ModelInfo, ModelOptions,
-    checkpoint::{QuantLoader, Tensor, TensorStore, concatenate},
+    checkpoint::{QuantLoader, Tensor, TensorStore},
+    cpu::Cpu,
+    output_head::OutputHead,
+    projection::Projection,
+    trace::Trace,
 };
 use crate::npu::{Attention, Backend, Linear};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    io::Write,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
-#[path = "cpu.rs"]
-mod cpu;
-use cpu::Cpu;
-
-struct Projection {
-    parts: Vec<(Linear, usize)>,
-    width: usize,
-}
-
-impl Projection {
-    fn load(
-        backend: &Backend,
-        loader: &Arc<QuantLoader>,
-        cpu: &Cpu,
-        modules: Vec<(String, usize)>,
-        k: usize,
-    ) -> Result<Self> {
-        let mut result = Self {
-            parts: Vec::new(),
-            width: 0,
-        };
-        let mut first = 0;
-        while first < modules.len() {
-            let bits = loader.bits(&modules[first].0)?;
-            let mut last = first + 1;
-            while last < modules.len() && loader.bits(&modules[last].0)? == bits {
-                last += 1;
-            }
-            let group = modules[first..last].to_vec();
-            let reload_loader = loader.clone();
-            let reload_group = group.clone();
-            let reload_pool = cpu.pool.clone();
-            let reload = move || {
-                reload_pool.install(|| {
-                    concatenate(
-                        reload_group
-                            .iter()
-                            .map(|(name, n)| reload_loader.load(name, *n, k))
-                            .collect::<Result<Vec<_>>>()?,
-                    )
-                })
-            };
-            let matrix = cpu.pool.install(|| {
-                concatenate(
-                    group
-                        .iter()
-                        .map(|(name, n)| loader.load(name, *n, k))
-                        .collect::<Result<Vec<_>>>()?,
-                )
-            })?;
-            let n = matrix.n;
-            let linear = backend.load(matrix, Some(Box::new(reload)))?;
-            result.parts.push((linear, result.width));
-            result.width += n;
-            first = last;
-        }
-        Ok(result)
-    }
-    fn run(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        rows: usize,
-        scratch: &mut [f32],
-    ) -> Result<()> {
-        if self.parts.len() == 1 {
-            return self.parts[0].0.run(input, output, rows);
-        }
-        for (linear, offset) in &self.parts {
-            let n = linear.n();
-            if rows == 1 {
-                linear.run(input, &mut output[*offset..*offset + n], 1)?;
-            } else {
-                linear.run(input, &mut scratch[..rows * n], rows)?;
-                for r in 0..rows {
-                    output[r * self.width + offset..r * self.width + offset + n]
-                        .copy_from_slice(&scratch[r * n..(r + 1) * n]);
-                }
-            }
-        }
-        Ok(())
-    }
-    fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
-        if self.parts.len() != 1 {
-            return Ok(false);
-        }
-        self.parts[0].0.run_swiglu(input, output, rows)
-    }
-}
-
+mod head;
 struct Layer {
     input_norm: Vec<f32>,
     post_norm: Vec<f32>,
@@ -142,18 +55,15 @@ fn norm(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
 }
 
 pub struct Dense {
-    trace_directory: Option<PathBuf>,
+    trace: Trace,
     options: ModelOptions,
     info: ModelInfo,
     loader: Arc<QuantLoader>,
     cpu: Cpu,
     backends: Vec<Backend>,
-    head_backend: Option<Backend>,
     layers: Vec<Layer>,
     embedding: Tensor,
-    floating_head: Option<Tensor>,
-    quantized_head: Option<Linear>,
-    head_bits: Option<u32>,
+    head: OutputHead,
     final_norm: Vec<f32>,
     cosine: Vec<f32>,
     sine: Vec<f32>,
@@ -187,12 +97,7 @@ pub struct Dense {
 impl Dense {
     pub fn load(options: ModelOptions) -> Result<Self> {
         let start = Instant::now();
-        let trace_directory = std::env::var_os("OPEN_RKNPU2_TRACE_DIR")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
-        if let Some(directory) = &trace_directory {
-            std::fs::create_dir_all(directory)?;
-        }
+        let trace = Trace::from_environment()?;
         let config: Value =
             serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
         let architecture = config["model_type"]
@@ -379,27 +284,23 @@ impl Dense {
             reserved += kv_per_layer;
             eprintln!("loaded layer {}/{count}", i + 1);
         }
-        let (head_backend, quantized_head, head_bits) = if quantized {
+        let head = if let Some(tensor) = floating_head {
+            OutputHead::floating(tensor, vocab, h)?
+        } else {
             ensure!(
                 backends.len() < 16,
                 "no NPU IOMMU domain available for lm_head"
             );
             let mut head_options = options.clone();
             head_options.chunk = 1;
-            let backend = Backend::new(&head_options, 15 - backends.len() as u32)?;
-            let matrix = cpu.pool.install(|| loader.load("lm_head", vocab, h))?;
-            let bits = matrix.bits;
-            let reload = loader.clone();
-            let pool = cpu.pool.clone();
-            let head = backend.load(
-                matrix,
-                Some(Box::new(move || {
-                    pool.install(|| reload.load("lm_head", vocab, h))
-                })),
-            )?;
-            (Some(backend), Some(head), Some(bits))
-        } else {
-            (None, None, None)
+            OutputHead::quantized(
+                &head_options,
+                15 - backends.len() as u32,
+                &loader,
+                &cpu,
+                vocab,
+                h,
+            )?
         };
         let final_norm = norm(&loader, "model.norm.weight", h)?;
         let mut cosine = vec![0.0; options.context * d / 2];
@@ -416,8 +317,7 @@ impl Dense {
         let scatter_width = layers
             .iter()
             .flat_map(|l| [&l.qkv, &l.gate_up])
-            .filter(|p| p.parts.len() > 1)
-            .flat_map(|p| p.parts.iter().map(|(linear, _)| linear.n()))
+            .map(Projection::scratch_width)
             .max()
             .unwrap_or(0);
         let eos_value = config.get("eos_token_id").cloned().unwrap_or(Value::Null);
@@ -448,18 +348,15 @@ impl Dense {
         };
         loader.store.release_pages()?;
         Ok(Self {
-            trace_directory,
+            trace,
             options,
             info,
             loader,
             cpu,
             backends,
-            head_backend,
             layers,
             embedding,
-            floating_head,
-            quantized_head,
-            head_bits,
+            head,
             final_norm,
             cosine,
             sine,
@@ -495,19 +392,7 @@ impl Dense {
     }
 
     fn trace(&self, layer: i32, stage: &str, values: &[f32]) -> Result<()> {
-        let Some(directory) = &self.trace_directory else {
-            return Ok(());
-        };
-        let path = directory.join(format!("p{}-l{layer}-{stage}.f32", self.position));
-        let mut file = std::fs::File::create(&path)
-            .with_context(|| format!("cannot write trace: {}", path.display()))?;
-        // RK3588 uses little-endian IEEE float32, matching the demo tensor trace ABI.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-        };
-        file.write_all(bytes)
-            .with_context(|| format!("cannot write trace: {}", path.display()))?;
-        Ok(())
+        self.trace.save(self.position, layer, stage, values)
     }
 
     fn chunk(&mut self, tokens: &[u32]) -> Result<()> {
@@ -611,7 +496,7 @@ impl Dense {
             self.timings.cpu += elapsed(start);
             self.trace(index, "post", &self.normalized[..rows * h])?;
             start = Instant::now();
-            if self.trace_directory.is_none()
+            if !self.trace.enabled()
                 && layer.gate_up.run_swiglu(
                     &self.normalized[..rows * h],
                     &mut self.middle[..rows * self.f],
@@ -656,7 +541,7 @@ impl Dense {
         self.position += rows;
         Ok(())
     }
-    fn forward_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<&[f32]> {
+    fn advance_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<usize> {
         ensure!(
             !tokens.is_empty() && tokens.len() <= self.options.context - self.position,
             "empty input or context capacity exceeded"
@@ -679,34 +564,11 @@ impl Dense {
             !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
             "generation cancelled"
         );
-        let start = Instant::now();
-        self.cpu.norm(
-            &self.hidden[(last_rows - 1) * self.h..last_rows * self.h],
-            &mut self.normalized[..self.h],
-            &self.final_norm,
-            self.epsilon,
-        );
-        self.trace(-1, "head_input", &self.normalized[..self.h])?;
-        if let Some(head) = &self.quantized_head {
-            head.run(&self.normalized[..self.h], &mut self.logits, 1)?;
-        } else {
-            self.cpu.dense_head(
-                self.floating_head.as_ref().unwrap(),
-                &self.normalized[..self.h],
-                &mut self.logits,
-            );
-        }
-        if self.logits_scaling != 1.0 {
-            for value in &mut self.logits {
-                *value /= self.logits_scaling;
-            }
-        }
-        self.timings.head += elapsed(start);
-        self.trace(-1, "logits", &self.logits)?;
-        ensure!(
-            self.logits.iter().all(|f| f.is_finite()),
-            "nonfinite logits"
-        );
+        Ok(last_rows)
+    }
+    fn forward_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<&[f32]> {
+        let last_rows = self.advance_impl(tokens, cancelled)?;
+        self.output_head(last_rows)?;
         Ok(&self.logits)
     }
 }
@@ -760,7 +622,7 @@ impl LanguageModel for Dense {
         let previous_tunes: usize = self
             .backends
             .iter()
-            .chain(self.head_backend.iter())
+            .chain(self.head.backend())
             .map(Backend::tune_operations)
             .sum();
         let mut rows = vec![1, self.options.chunk];
@@ -777,14 +639,14 @@ impl LanguageModel for Dense {
                 backend.prepare(prompt_tokens % self.options.chunk)?;
             }
         }
-        if let Some(head) = &self.head_backend {
+        if let Some(head) = self.head.backend() {
             head.prepare(1)?;
         }
         self.timings.prepare += elapsed(start);
         if self
             .backends
             .iter()
-            .chain(self.head_backend.iter())
+            .chain(self.head.backend())
             .map(Backend::tune_operations)
             .sum::<usize>()
             != previous_tunes
@@ -792,6 +654,9 @@ impl LanguageModel for Dense {
             self.loader.store.release_pages()?;
         }
         Ok(())
+    }
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        self.advance_impl(tokens, None).map(|_| ())
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         self.forward_impl(tokens, None)
@@ -834,22 +699,13 @@ impl LanguageModel for Dense {
             );
             let vocab = self.info.vocab_size;
             self.batch_logits.resize(rows * vocab, 0.0);
-            if let Some(head) = &self.quantized_head {
-                self.head_backend.as_ref().unwrap().prepare(rows)?;
-                head.run(
-                    &self.normalized[..rows * self.h],
-                    &mut self.batch_logits,
-                    rows,
-                )?;
-            } else {
-                for r in 0..rows {
-                    self.cpu.dense_head(
-                        self.floating_head.as_ref().unwrap(),
-                        &self.normalized[r * self.h..(r + 1) * self.h],
-                        &mut self.batch_logits[r * vocab..(r + 1) * vocab],
-                    );
-                }
-            }
+            self.head.prepare(rows)?;
+            self.head.run(
+                &self.cpu,
+                &self.normalized[..rows * self.h],
+                &mut self.batch_logits,
+                rows,
+            )?;
             if self.logits_scaling != 1.0 {
                 for value in &mut self.batch_logits {
                     *value /= self.logits_scaling;
@@ -870,46 +726,7 @@ impl LanguageModel for Dense {
         Ok(result)
     }
     fn stats(&self) -> Value {
-        let mut domains: Vec<Value> = self.backends.iter().map(Backend::stats).collect();
-        if let Some(head) = &self.head_backend {
-            domains.push(head.stats());
-        }
-        let mut result = json!({"domains": domains});
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for (prefix, key) in [("VmRSS:", "rss_kib"), ("VmHWM:", "peak_rss_kib")] {
-                if let Some(kib) = status
-                    .lines()
-                    .find_map(|line| line.strip_prefix(prefix))
-                    .and_then(|value| value.split_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-                {
-                    result[key] = json!(kib);
-                }
-            }
-        }
-        for key in [
-            "loaded_w4",
-            "loaded_w8",
-            "weight_payload_bytes",
-            "workspace_payload_bytes",
-            "tuning_material_bytes",
-            "workspace_count",
-            "tune_cache_hits",
-            "tune_cache_misses",
-            "tune_calls",
-            "strategy_fallbacks",
-            "strategy_fallback_calls",
-            "weight_reload_calls",
-            "weight_profile_creations",
-            "attention_cpu_staging_bytes",
-        ] {
-            result[key] = json!(
-                domains
-                    .iter()
-                    .map(|d| d[key].as_u64().unwrap_or(0))
-                    .sum::<u64>()
-            );
-        }
+        let mut result = super::metrics::backend_stats(&self.backends, self.head.backend());
         let buffers = [
             &self.hidden,
             &self.normalized,
@@ -949,14 +766,15 @@ impl LanguageModel for Dense {
                 .sum::<u64>()
         );
         result["mapped_weight_bytes"] = json!(self.loader.store.mapped_bytes());
-        result["lm_head_weight_bits"] = json!(self.head_bits);
+        result["lm_head_weight_bits"] = json!(self.head.bits());
         result["lm_head_backend"] = json!(
-            self.head_bits
+            self.head
+                .bits()
                 .map(|b| format!("open-rknpu2-w{b}a8"))
                 .unwrap_or_else(|| "cpu-floating".into())
         );
         result["position"] = json!(self.position);
-        result["trace_directory"] = json!(self.trace_directory);
+        result["trace_directory"] = json!(self.trace.path());
         result["layers"] = json!(self.layers.len());
         result["attention_backend"] = json!("native-npu-gqa-stable-softmax");
         result["activation_quantization"] = json!("full-K maxabs/127, round-away, clamp[-127,127]");

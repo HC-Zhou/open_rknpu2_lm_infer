@@ -1,10 +1,12 @@
 use crate::{
     engine::BoardLock,
-    model::{self, LanguageModel, ModelOptions},
+    model::{self, ModelOptions},
 };
 use anyhow::{Result, ensure};
 use serde_json::json;
-use std::{path::PathBuf, time::Instant};
+use std::path::PathBuf;
+mod phases;
+use phases::measure_phases;
 
 fn summary(samples: &[f64], tokens: usize) -> serde_json::Value {
     let speeds: Vec<_> = samples
@@ -79,11 +81,13 @@ pub fn run(
         options.context
     );
     let _lock = BoardLock::acquire()?;
+    let chunk = options.chunk;
     let mut model = model::load(options)?;
     let mut rng = Mt19937::new(42);
     let tokens: Vec<_> = (0..capacity)
         .map(|_| rng.next() % model.info().vocab_size as u32)
         .collect();
+    let head_free_check = phases::verify_head_free(model.as_mut(), &tokens, chunk)?;
     let mut results = Vec::new();
     for &case in cases {
         let Case {
@@ -97,8 +101,10 @@ pub fn run(
         let mut pp = Vec::new();
         let mut tg = Vec::new();
         let mut pg = Vec::new();
+        let mut stage_samples = Vec::new();
         for repetition in 0..repetitions {
-            let (prefill, decode) = measure_phases(model.as_mut(), &tokens, case)?;
+            let measurement = measure_phases(model.as_mut(), &tokens, case)?;
+            let (prefill, decode) = (measurement.prefill, measurement.decode);
             eprintln!(
                 "bench: sample {}/{repetitions}, prefill {prefill:.3} ms, decode {decode:.3} ms",
                 repetition + 1
@@ -106,14 +112,17 @@ pub fn run(
             pp.push(prefill);
             tg.push(decode);
             pg.push(prefill + decode);
+            stage_samples.push(measurement.stages);
         }
         results.push(json!({"prompt":prompt,"generate":generate,"depth":depth,
             "prefill":if prompt>0 {summary(&pp,prompt)} else {serde_json::Value::Null},
             "decode":if generate>0 {summary(&tg,generate)} else {serde_json::Value::Null},
-            "prompt_gen":if prompt>0 && generate>0 {summary(&pg,prompt+generate)} else {serde_json::Value::Null},"stats":model.stats()}));
+            "prompt_gen":if prompt>0 && generate>0 {summary(&pg,prompt+generate)} else {serde_json::Value::Null},
+            "stage_samples":stage_samples,"stats":model.stats()}));
     }
     let mut result = json!({"model":model.info(),"warmup":1,"repetitions":repetitions,
-        "timing":"independent pp/tg cases; pg preserves prefill KV for decode; complete synchronous model calls including output head; excludes load, preparation, untimed depth prefill, tokenization, sampling",
+        "timing":"head-free prefill and history; decode includes one output head per consumed token; pg preserves prompt state; excludes load, preparation, untimed depth prefill, tokenization, sampling and stats snapshots",
+        "prefill_without_lm_head":true,"head_free_check":head_free_check,
         "seed":42,"token_source":"mt19937(seed) % vocab_size","synthetic_token_ids":tokens,
         "cases":results,"stats":model.stats()});
     if cases.len() == 1 {
@@ -136,35 +145,6 @@ pub fn run(
         )?;
     }
     Ok(())
-}
-
-fn measure_phases(model: &mut dyn LanguageModel, tokens: &[u32], case: Case) -> Result<(f64, f64)> {
-    let Case {
-        prompt,
-        generate,
-        depth,
-    } = case;
-    model.reset()?;
-    if depth > 0 {
-        model.prepare(depth)?;
-        model.forward(&tokens[..depth])?;
-    }
-    model.prepare(prompt.max(1))?;
-    let mut pp = 0.0;
-    if prompt > 0 {
-        let start = Instant::now();
-        model.forward(&tokens[depth..depth + prompt])?;
-        pp = start.elapsed().as_secs_f64() * 1000.0;
-    }
-    let mut tg = 0.0;
-    if generate > 0 {
-        let start = Instant::now();
-        for &token in &tokens[depth + prompt..depth + prompt + generate] {
-            model.forward(&[token])?;
-        }
-        tg = start.elapsed().as_secs_f64() * 1000.0;
-    }
-    Ok((pp, tg))
 }
 
 struct Mt19937 {
@@ -205,6 +185,7 @@ impl Mt19937 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::LanguageModel;
 
     struct RecordingModel {
         info: crate::model::ModelInfo,
@@ -212,6 +193,7 @@ mod tests {
         resets: usize,
         forwards: Vec<(usize, Vec<u32>)>,
         logits: [f32; 1],
+        head_calls: usize,
     }
     impl LanguageModel for RecordingModel {
         fn info(&self) -> &crate::model::ModelInfo {
@@ -225,9 +207,14 @@ mod tests {
         fn prepare(&mut self, _: usize) -> Result<()> {
             Ok(())
         }
-        fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
+        fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
             self.forwards.push((self.position, tokens.to_vec()));
             self.position += tokens.len();
+            Ok(())
+        }
+        fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
+            self.head_calls += 1;
+            self.prefill(tokens)?;
             Ok(&self.logits)
         }
         fn position(&self) -> usize {
@@ -252,6 +239,7 @@ mod tests {
             resets: 0,
             forwards: vec![],
             logits: [0.0],
+            head_calls: 0,
         };
         measure_phases(&mut model, &[10, 11, 12, 13, 14, 15], Case::new(3, 2, 1))?;
         assert_eq!(model.resets, 1);
@@ -265,6 +253,10 @@ mod tests {
             ]
         );
         assert_eq!(model.position, 6);
+        assert_eq!(
+            model.head_calls, 2,
+            "prompt and history must not evaluate lm_head"
+        );
         Ok(())
     }
 

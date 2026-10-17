@@ -3,7 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod checkpoint;
+pub(crate) mod cpu;
 pub mod dense;
+pub(crate) mod metadata;
+pub(crate) mod metrics;
+pub(crate) mod output_head;
+pub(crate) mod projection;
+pub mod qwen35;
+pub(crate) mod trace;
 
 #[derive(Debug, Clone)]
 pub struct ModelOptions {
@@ -39,6 +46,11 @@ pub trait LanguageModel {
         Ok(())
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()>;
+    /// Consume prompt/history tokens without evaluating final output norm or
+    /// lm_head. Generation uses `forward` when next-token logits are required.
+    fn prefill(&mut self, _tokens: &[u32]) -> Result<()> {
+        anyhow::bail!("this model has no head-free prefill implementation")
+    }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]>;
     fn forward_cancellable(
         &mut self,
@@ -80,8 +92,9 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     match config["model_type"].as_str() {
         Some("qwen3" | "llama" | "granite") => Ok(Box::new(dense::Dense::load(options)?)),
+        Some("qwen3_5" | "qwen3_5_text") => Ok(Box::new(qwen35::Qwen35::load(options)?)),
         other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite"
+            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text"
         ),
     }
 }

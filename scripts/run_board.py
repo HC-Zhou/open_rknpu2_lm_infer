@@ -17,9 +17,20 @@ TARGETS = {
 }
 
 
-def snapshot():
+def clock_targets(cpu_khz, skip_dmc):
     result = {}
-    for root, (minimum, maximum, current, _) in TARGETS.items():
+    for root, (minimum, maximum, current, target) in TARGETS.items():
+        if skip_dmc and root.name == "dmc":
+            continue
+        if minimum.startswith("scaling"):
+            target = cpu_khz
+        result[root] = (minimum, maximum, current, target)
+    return result
+
+
+def snapshot(targets):
+    result = {}
+    for root, (minimum, maximum, current, _) in targets.items():
         fields = [minimum, maximum, current]
         fields.append("scaling_governor" if minimum.startswith("scaling") else "governor")
         result[str(root)] = {field: (root / field).read_text().strip() for field in fields}
@@ -39,14 +50,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--wait-lock", action="store_true", help="wait for another board job to release the NPU")
+    parser.add_argument("--cpu-khz", type=int, default=2400000, help="fixed big-core frequency in kHz")
+    parser.add_argument("--skip-dmc", action="store_true", help="leave DDR uncontrolled on boards without DMC devfreq")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.cpu_khz <= 0:
+        parser.error("--cpu-khz must be positive")
+    targets = clock_targets(args.cpu_khz, args.skip_dmc)
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
     if not command:
         parser.error("specify the executable and arguments after --")
     report = {"command": command, "started_unix": time.time(), "restore_errors": []}
+    report["clock_policy"] = {"cpu_khz": args.cpu_khz, "dmc_controlled": not args.skip_dmc}
     status = 1
     with open("/tmp/rknpu_lowlevel_submit.lock", "a+") as lock:
         try:
@@ -55,17 +72,17 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | (0 if args.wait_lock else fcntl.LOCK_NB))
         except BlockingIOError:
             raise SystemExit("NPU is in use: /tmp/rknpu_lowlevel_submit.lock")
-        before = snapshot()
+        before = snapshot(targets)
         report["before"] = before
         changed = []
         try:
             subprocess.run(["sudo", "-n", "true"], check=True)
-            for root, (minimum, maximum, _, target) in TARGETS.items():
+            for root, (minimum, maximum, _, target) in targets.items():
                 changed.append(root)
                 write(root / maximum, target)
                 write(root / minimum, target)
-            report["fixed"] = snapshot()
-            for root, (minimum, maximum, _, target) in TARGETS.items():
+            report["fixed"] = snapshot(targets)
+            for root, (minimum, maximum, _, target) in targets.items():
                 fixed = report["fixed"][str(root)]
                 if int(fixed[minimum]) != target or int(fixed[maximum]) != target:
                     raise RuntimeError("fixed clock verification failed: " + str(root))
@@ -77,20 +94,20 @@ def main():
             start = time.monotonic()
             status = subprocess.run(command, env=env, pass_fds=(lock.fileno(),)).returncode
             report["command_elapsed_seconds"] = time.monotonic() - start
-            report["after_command"] = snapshot()
+            report["after_command"] = snapshot(targets)
         except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
             status = 1
             report["error"] = str(error)
             print("run_board:", error, flush=True)
         finally:
             for root in reversed(changed):
-                minimum, maximum, _, _ = TARGETS[root]
+                minimum, maximum, _, _ = targets[root]
                 try:
                     write(root / minimum, before[str(root)][minimum])
                     write(root / maximum, before[str(root)][maximum])
                 except (OSError, subprocess.CalledProcessError) as error:
                     report["restore_errors"].append(str(error))
-            report["restored"] = snapshot()
+            report["restored"] = snapshot(targets)
             if report["restore_errors"]:
                 status = 1
             report["exit_code"] = status

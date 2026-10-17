@@ -88,7 +88,7 @@ pub fn run(
         let tick = Instant::now();
         model.reset()?;
         if score_start > 1 {
-            model.forward(&window[..score_start - 1])?;
+            model.prefill(&window[..score_start - 1])?;
         }
         let values =
             model.token_nll(&window[score_start - 1..length - 1], &window[score_start..])?;
