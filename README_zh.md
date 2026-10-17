@@ -73,6 +73,8 @@
 
 程序支持线性层使用w4a8或w8a8(可以混合使用)per-channel per-token对称量化的 compressed-tensors 格式的模型。因此你也可以根据以上示例模型，尝试加载其他大小的模型，试验不同的混合量化配置和量化算法。
 
+实验性 `qwen3_5` / `qwen3_5_text` 后端已接入混合文本主干和 PPL 评分。checkpoint 与验证范围见 [C7 上板报告](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md)；MTP 和多模态执行尚待实现。
+
 ## 快速开始
 
 在 RK3588 Linux 板上复制粘贴以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
@@ -111,14 +113,16 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
                  │
    Engine ── 专用推理线程 · 请求队列 · 采样 · 前缀 KV 复用
                  │
-   LanguageModel ── Qwen3 / Llama / Granite
+   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5（文本）
         │                         │
-   CPU (Rust)                NPU (rk_npu_matmul, C ABI)
-   RMSNorm · RoPE · 残差      W4A8/W8A8 Linear · FP16 GQA Attention
+   CPU (Rust + C++)          NPU (rk_npu_matmul, C ABI)
+   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · FP16 GQA Attention
                                   │
                          开源 RKNPU2 内核驱动
 ```
 
+
+通用 CPU 算子位于 `src/ops/`，可复用 GDN 层和状态事务位于 `src/layers/`；`src/model/` 负责 checkpoint 与模型执行。Dense 和实验性 Qwen3.5 共用输出投影、trace 和量化投影组件。职责边界见 [模块组织说明](llm_generated_docs/RUNTIME_MODULE_LAYOUT.md)。
 
 ## 开发
 

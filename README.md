@@ -73,6 +73,8 @@
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
+An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. See the [C7 board validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) for checkpoint details and tested scope. MTP and multimodal execution are pending.
+
 ## Quick Start
 
 Copy and paste the following commands on an RK3588 Linux board to download the latest [release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) and the Qwen3-4B model, then start a terminal chat session. Supports Debian 11 / glibc 2.31 or newer, with no compilation required.
@@ -111,14 +113,16 @@ The first tuning run can take several minutes and shows progress and the best ca
                  │
    Engine ── Dedicated inference thread · Request queue · Sampling · Prefix KV reuse
                  │
-   LanguageModel ── Qwen3 / Llama / Granite
+   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5 (text)
         │                         │
-   CPU (Rust)                NPU (rk_npu_matmul, C ABI)
-   RMSNorm · RoPE · Residual  W4A8/W8A8 Linear · FP16 GQA Attention
+   CPU (Rust + C++)          NPU (rk_npu_matmul, C ABI)
+   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · FP16 GQA Attention
                                   │
                          Open-source RKNPU2 kernel driver
 ```
 
+
+Shared CPU operators live in `src/ops/`, reusable GDN layers and state transactions in `src/layers/`, and checkpoint loading and model execution in `src/model/`. Dense and experimental Qwen3.5 share output projections, tracing and quantized projection components. See the [module layout](llm_generated_docs/RUNTIME_MODULE_LAYOUT.md).
 
 ## Development
 

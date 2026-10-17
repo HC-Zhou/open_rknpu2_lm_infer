@@ -1,5 +1,7 @@
 # RK3588 performance
 
+现行 `bench` 的 prefill 与历史构建不执行 lm_head，decode 每步执行一次输出头；报告提供阶段计时和无 head 路径的继续解码一致性检查。本文历史表保留原测量口径（prefill 末行一次 head），不与新口径混算。Qwen3.5 / Qwen3 同板新测见 [QWEN35_VS_QWEN3_PERFORMANCE.md](QWEN35_VS_QWEN3_PERFORMANCE.md)。
+
 ## 三款模型的上下文测速
 
 原厂 RKLLM 1.3.1 的完整对照、同为3800-token 历史的 decode128 实测及前缀 PPL 见 [SDK_COMPARISON.md](SDK_COMPARISON.md)。Qwen3 性能数据对应 `Qwen3-4B-W4A8-Mixed-LMHeadW8`，PPL 对应 `selection/models/C7-Rotate-QQQ`。
