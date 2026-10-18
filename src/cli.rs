@@ -1,6 +1,7 @@
+mod tune;
 use crate::{
     engine::{Engine, GenerationEvent, GenerationRequest, Prompt},
-    model::ModelOptions,
+    model::{ModelOptions, VisionDtype},
     sampling::SamplingParams,
     text::TextCodec,
 };
@@ -65,6 +66,14 @@ pub struct ModelArgs {
     pub no_tune: bool,
     #[arg(long, global = true, default_value_t = 512)]
     pub attention_tile: usize,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "fp16",
+        help = "ViT intermediate tensor dtype; NPU matmul remains FP16"
+    )]
+    pub vision_dtype: VisionDtype,
 }
 fn parse_u64(s: &str) -> std::result::Result<u64, String> {
     if let Some(s) = s.strip_prefix("0x") {
@@ -107,6 +116,7 @@ impl ModelArgs {
             tune_search: false,
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
+            vision_dtype: self.vision_dtype,
         })
     }
 }
@@ -126,6 +136,9 @@ pub enum Command {
         prompt: Option<String>,
         #[arg(short = 'f', long = "file", conflicts_with_all = ["input", "prompt"])]
         prompt_file: Option<PathBuf>,
+        /// Attach PNG/JPEG images to a templated user message; repeat for multiple images.
+        #[arg(long = "image")]
+        images: Vec<PathBuf>,
         #[arg(
             long = "conversation",
             help = "Apply the model chat template; also accepts -cnv"
@@ -200,6 +213,12 @@ pub enum Command {
     Bench(BenchArgs),
     /// Explicitly search missing strategies and save them for later inference.
     Tune {
+        /// Tune the vision encoder; default input presets are 256x256, 384x256 and 512x512.
+        #[arg(long, conflicts_with = "batches")]
+        vision: bool,
+        /// Tune for the actual resized dimensions of these PNG/JPEG images.
+        #[arg(long = "image", requires = "vision")]
+        images: Vec<PathBuf>,
         #[arg(long, value_delimiter = ',', num_args = 1..,
             help = "Actual prefill lengths to prepare; default: 1 and --ubatch-size")]
         batches: Vec<usize>,
@@ -441,6 +460,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             input,
             prompt: text,
             prompt_file,
+            images,
             chat_template,
             thinking,
             stats,
@@ -448,9 +468,23 @@ pub async fn execute(cli: Cli) -> Result<()> {
         } => {
             let sampling = generation.sampling()?;
             let text = read_prompt(text.or(input), prompt_file)?;
+            let prompt = if images.is_empty() {
+                prompt(text, chat_template, thinking)
+            } else {
+                let mut content = Vec::new();
+                for path in images {
+                    content.push(serde_json::json!({"type":"image_url","image_url":{"url":crate::vision::data_url(&path)?}}));
+                }
+                content.push(serde_json::json!({"type":"text","text":text}));
+                Prompt::Chat {
+                    messages: vec![serde_json::json!({"role":"user","content":content})],
+                    tools: None,
+                    enable_thinking: thinking,
+                }
+            };
             let engine = Engine::start(options)?;
             let mut handle = engine.generate(GenerationRequest {
-                prompt: prompt(text, chat_template, thinking),
+                prompt,
                 sampling,
                 max_tokens: generation.max_tokens,
                 stop: generation.stop,
@@ -500,49 +534,13 @@ pub async fn execute(cli: Cli) -> Result<()> {
             args.repetitions,
             args.report,
         )?,
-        Command::Tune { batches, report } => {
-            anyhow::ensure!(options.tune, "tune cannot be combined with --no-tune");
-            let mut batches = if batches.is_empty() {
-                vec![1, options.chunk]
-            } else {
-                batches
-            };
-            anyhow::ensure!(
-                batches.iter().all(|&m| m > 0 && m <= options.chunk),
-                "tuning batches must be within 1..ubatch-size"
-            );
-            batches.sort_unstable();
-            batches.dedup();
-            let _lock = crate::engine::BoardLock::acquire()?;
-            let start = std::time::Instant::now();
-            eprintln!(
-                "Tuning: loading model; cache={} (existing entries are reused)",
-                options.tune_cache.display()
-            );
-            let mut options = options;
-            options.tune_search = true;
-            let mut model = crate::model::load(options)?;
-            for (index, &rows) in batches.iter().enumerate() {
-                eprintln!(
-                    "Tuning batch {}/{}: M={rows}, elapsed={:.1}s",
-                    index + 1,
-                    batches.len(),
-                    start.elapsed().as_secs_f64()
-                );
-                model.prepare(rows)?;
-            }
-            let stats = serde_json::json!({"batches":batches,"elapsed_seconds":start.elapsed().as_secs_f64(),"stats":model.stats()});
-            eprintln!(
-                "Tuning complete: {:.1}s; hits={}, searched={}, fallback={}",
-                start.elapsed().as_secs_f64(),
-                stats["stats"]["tune_cache_hits"],
-                stats["stats"]["tune_calls"],
-                stats["stats"]["strategy_fallbacks"]
-            );
-            if let Some(path) = report {
-                std::fs::write(path, serde_json::to_vec_pretty(&stats)?)?;
-            }
-            println!("{}", serde_json::to_string_pretty(&stats)?);
+        Command::Tune {
+            vision,
+            images,
+            batches,
+            report,
+        } => {
+            tune::run(options, vision, images, batches, report)?;
         }
         Command::Eval {
             tokens_file,
@@ -565,6 +563,39 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
+    }
+
+    #[test]
+    fn vision_dtype_defaults_to_fp16_and_supports_fp32() {
+        let cli = parse(&["infer", "-m", "model", "run", "hello"]);
+        assert_eq!(cli.model.options().unwrap().vision_dtype, VisionDtype::Fp16);
+        for command in ["run", "chat", "serve"] {
+            let cli = parse(&["infer", "-m", "model", command, "--vision-dtype", "fp32"]);
+            assert_eq!(cli.model.options().unwrap().vision_dtype, VisionDtype::Fp32);
+        }
+        assert!(Cli::try_parse_from(["infer", "run", "--vision-dtype", "bf16"]).is_err());
+    }
+
+    #[test]
+    fn vision_tuning_accepts_images_and_keeps_text_batches_separate() {
+        let cli = parse(&[
+            "infer", "-m", "model", "tune", "--vision", "--image", "a.jpg", "--image", "b.png",
+        ]);
+        match cli.command {
+            Command::Tune {
+                vision,
+                images,
+                batches,
+                ..
+            } => {
+                assert!(vision);
+                assert_eq!(images, vec![PathBuf::from("a.jpg"), PathBuf::from("b.png")]);
+                assert!(batches.is_empty());
+            }
+            _ => panic!("expected tune command"),
+        }
+        assert!(Cli::try_parse_from(["infer", "tune", "--image", "a.jpg"]).is_err());
+        assert!(Cli::try_parse_from(["infer", "tune", "--vision", "--batches", "128"]).is_err());
     }
 
     #[test]

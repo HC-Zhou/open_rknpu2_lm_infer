@@ -5,6 +5,49 @@ edition = "2024"
 rust-version = "1.95"
 description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"
 license = "AGPL-3.0-only"
+autoexamples = false
+
+# Standalone test and benchmark tools. Example targets keep them separately
+# runnable without executing model/device programs during the default tests.
+[[example]]
+name = "causal_conv_bench"
+path = "tests/tools/causal_conv_bench.rs"
+test = false
+
+[[example]]
+name = "float_tune"
+path = "tests/tools/float_tune.rs"
+test = false
+
+[[example]]
+name = "gdn_bench"
+path = "tests/tools/gdn_bench.rs"
+test = false
+
+[[example]]
+name = "gdn_small_bench"
+path = "tests/tools/gdn_small_bench.rs"
+test = false
+
+[[example]]
+name = "qwen35_check"
+path = "tests/tools/qwen35_check.rs"
+test = false
+
+[[example]]
+name = "qwen35_inventory"
+path = "tests/tools/qwen35_inventory.rs"
+test = false
+
+[[example]]
+name = "vision_probe"
+path = "tests/tools/vision_probe.rs"
+test = false
+
+[[example]]
+name = "vision_profile"
+path = "tests/tools/vision_profile.rs"
+test = false
 
 [dependencies]
 anyhow = "1"
@@ -28,6 +71,9 @@ rand_chacha = "0.3"
 libc = "0.2"
 rayon = "1"
 regex = "1"
+base64 = "0.22"
+sha2 = "0.10"
+image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

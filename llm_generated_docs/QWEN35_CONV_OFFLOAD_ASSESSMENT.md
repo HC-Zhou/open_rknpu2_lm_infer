@@ -23,7 +23,7 @@
 
 原始计时、正确性、频率恢复和占比计算保存在 [evidence/qwen35_conv_20261017/](evidence/qwen35_conv_20261017/)，主结果为 `results-release{,-repeat}.json`，汇总为 `summary.json`。独立诊断计时受缓存和调度影响，不能相减当作精确阶段拆分。
 
-复现入口：[权重/trace导出](../scripts/qwen35/export_conv_bench.py)、[CPU重放程序](../examples/causal_conv_bench.rs)。原始权重、trace和实测二进制保留在本机共享目录 `/home/zt/mnt/3090x4/tmp/qwen35-dev/conv-probe-20261017/`，板端对应 `/home/firefly/mnt/3090x4/tmp/qwen35-dev/conv-probe-20261017/`，未拷入仓库。导出来源逐层记录于 `input-metadata.json`。
+复现入口：[权重/trace导出](../scripts/qwen35/export_conv_bench.py)、[CPU重放程序](../tests/tools/causal_conv_bench.rs)。原始权重、trace和实测二进制保留在本机共享目录 `/home/zt/mnt/3090x4/tmp/qwen35-dev/conv-probe-20261017/`，板端对应 `/home/firefly/mnt/3090x4/tmp/qwen35-dev/conv-probe-20261017/`，未拷入仓库。导出来源逐层记录于 `input-metadata.json`。
 
 ```sh
 python3 scripts/qwen35/export_conv_bench.py --model /path/to/C7 \

@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-18",
+  "scope": "Historical FP16 matmul and ViT experiments; excluded from production builds",
+  "files": [
+    {
+      "original_path": "scripts/diagnostics/build_fp16_stage_trace.py",
+      "archived_path": "build_fp16_stage_trace.py",
+      "original_sha256": "8a331083b71b50641d002f1eb4cd0409823bcb2f7d51b9a944cbd267fd7e791b",
+      "archived_sha256": "962f3312b4a8c0ee4791230d41b498799fe3613c4a4a4f8c794daabae0130172"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_device_probe.cpp",
+      "archived_path": "fp16_device_probe.cpp",
+      "original_sha256": "6b80b0f0a7c5a9effdbd3b3b6b531ce574ba7f5c309b0ff796d255481d4f649d",
+      "archived_sha256": "6b80b0f0a7c5a9effdbd3b3b6b531ce574ba7f5c309b0ff796d255481d4f649d"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_reduce_probe.cpp",
+      "archived_path": "fp16_reduce_probe.cpp",
+      "original_sha256": "e8243bede7b00c7cae037d4bb47a5ec93e1f85fae444d005f90ed24fcb2059da",
+      "archived_sha256": "e8243bede7b00c7cae037d4bb47a5ec93e1f85fae444d005f90ed24fcb2059da"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_stage_probe.cpp",
+      "archived_path": "fp16_stage_probe.cpp",
+      "original_sha256": "807cf831cff8d8e7d7dba388314c6f413eb911f3114ecf6fd873323a2628f00c",
+      "archived_sha256": "807cf831cff8d8e7d7dba388314c6f413eb911f3114ecf6fd873323a2628f00c"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_stage_trace.cpp",
+      "archived_path": "fp16_stage_trace.cpp",
+      "original_sha256": "332f797f3587408d8def3dffec8b485c4aaf3eeda6b25321fb61d7c127cb5daf",
+      "archived_sha256": "332f797f3587408d8def3dffec8b485c4aaf3eeda6b25321fb61d7c127cb5daf"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_stage_trace.h",
+      "archived_path": "fp16_stage_trace.h",
+      "original_sha256": "6daabd0c86a4a9b7543d6221d7565c4f9356692bc1869c880692a8f985a7a7f6",
+      "archived_sha256": "6daabd0c86a4a9b7543d6221d7565c4f9356692bc1869c880692a8f985a7a7f6"
+    },
+    {
+      "original_path": "scripts/diagnostics/fp16_tune_compare.cpp",
+      "archived_path": "fp16_tune_compare.cpp",
+      "original_sha256": "79e3be1654384eb176748b507b0f1c59f8a596d202756f7ce84742ec89fd9392",
+      "archived_sha256": "79e3be1654384eb176748b507b0f1c59f8a596d202756f7ce84742ec89fd9392"
+    },
+    {
+      "original_path": "scripts/diagnostics/npu_ioctl_profile.cpp",
+      "archived_path": "npu_ioctl_profile.cpp",
+      "original_sha256": "71de81567e1c82c268b6d24dbbcec88fd52b20f203d9bb4546c26f4b5a178dd5",
+      "archived_sha256": "71de81567e1c82c268b6d24dbbcec88fd52b20f203d9bb4546c26f4b5a178dd5"
+    },
+    {
+      "original_path": "scripts/diagnostics/summarize_float_k_tiling.py",
+      "archived_path": "summarize_float_k_tiling.py",
+      "original_sha256": "273a27be73e71797b2988205687209a51b7044c23aa859fd86000313f6d1ae6e",
+      "archived_sha256": "95f949344affa36add4cb88e33616aef2fcb11b6e78e3a9cb754e719dfd02168"
+    },
+    {
+      "original_path": "scripts/diagnostics/summarize_float_util.py",
+      "archived_path": "summarize_float_util.py",
+      "original_sha256": "98c99ee1638ed2f73f70e7ba546b7a140ef294fabe0a83689e467360e0c7e77e",
+      "archived_sha256": "98c99ee1638ed2f73f70e7ba546b7a140ef294fabe0a83689e467360e0c7e77e"
+    },
+    {
+      "original_path": "scripts/diagnostics/vision_prefix_inputs.py",
+      "archived_path": "vision_prefix_inputs.py",
+      "original_sha256": "8f4f71520f7d428771d0a2b0f300d35d16eedfb660bd8fa631aa511d1faf43ab",
+      "archived_sha256": "8f4f71520f7d428771d0a2b0f300d35d16eedfb660bd8fa631aa511d1faf43ab"
+    },
+    {
+      "original_path": "scripts/diagnostics/vision_stage_oracle.py",
+      "archived_path": "vision_stage_oracle.py",
+      "original_sha256": "773a35766e4cf28faea964194fdb80bfee7273618312806aa596fdd368b75db0",
+      "archived_sha256": "8209a43804b6aea19d4e43f3ba99ada0ec10f54acb7adfe38ff80e1cab07c46a"
+    },
+    {
+      "original_path": "scripts/compare_float_autotune.py",
+      "archived_path": "compare_float_autotune.py",
+      "original_sha256": "393a3aa37c8659f96ff2c0e5a5dee134bb635afdd246601e76ae8fadae83c679",
+      "archived_sha256": "393a3aa37c8659f96ff2c0e5a5dee134bb635afdd246601e76ae8fadae83c679"
+    }
+  ]
+}

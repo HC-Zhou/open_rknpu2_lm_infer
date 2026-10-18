@@ -32,4 +32,21 @@ impl Trace {
         file.write_all(bytes)?;
         Ok(())
     }
+    pub fn save_half(
+        &self,
+        position: usize,
+        layer: i32,
+        stage: &str,
+        values: &[u16],
+    ) -> Result<()> {
+        if self.enabled() {
+            self.save(
+                position,
+                layer,
+                stage,
+                &crate::ops::vision_half::widen(values),
+            )?;
+        }
+        Ok(())
+    }
 }

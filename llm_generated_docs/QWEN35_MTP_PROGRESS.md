@@ -27,7 +27,7 @@ GDN 算子已完成与实际 llama.cpp 的直接对照：C++ 模块经 Rust 接�
 | `src/model/projection.rs`、`metrics.rs`、`metadata.rs` | 共享量化投影、统计和模型元数据 |
 | `src/npu/attention.rs`、`policy.rs` | 原生 Attention、窄 W8 投影核数选择 |
 | `src/speculative.rs` | pending-anchor 预算和 greedy 接受账本 |
-| `tests/cpu_layers/`、`examples/gdn_bench.rs`、`scripts/gdn/` | 公共 CPU 层测试、ggml 对照与独立 kernel 复现 |
+| `tests/cpu_layers/`、`tests/tools/gdn_bench.rs`、`scripts/gdn/` | 公共 CPU 层测试、ggml 对照与独立 kernel 复现 |
 
 `model::load` 注册 `qwen3_5` / `qwen3_5_text`。原 `dense.rs` 的投影与统计抽为公共模块，原 `npu.rs` 的 Attention 实现移入子模块；不把 hybrid decoder 堆进已有长文件。CLI 元数据解析同样移入共享模块。通用算子/层不反向依赖 `model::qwen35`；完整职责边界见 [RUNTIME_MODULE_LAYOUT.md](RUNTIME_MODULE_LAYOUT.md)。
 
@@ -97,6 +97,8 @@ C7 首次接入后的默认测试为 51 passed、7 ignored；当时额外显式�
 | P3 | NOT_IMPLEMENTED：MTP 网络、prompt prefill、seed 与 draft KV 修复待实现 | NOT_RUN | NOT_RUN | NOT_MEASURED |
 | P4 | PARTIAL：pending-anchor 预算、greedy 接受账本、多行输出头评分；target hidden 接口和 MTP driver 待接入 | 小词表协议 oracle PASS；真实文本 PPL PASS；真实 MTP 未验证 | TEXT_PPL_PASS | NOT_MEASURED |
 | P5–P8 | NOT_IMPLEMENTED | NOT_RUN | NOT_RUN | NOT_MEASURED |
+
+2026-10-18补充：P5静态图像功能已接入ViT、上下文身份/三轴位置、CLI/TUI和API，功能及数值记录见 [QWEN35_VISION_PROGRESS.md](QWEN35_VISION_PROGRESS.md)。严格图文logits分布检查保留失败，未将功能验证称作精度完全等价；P6–P8与MTP生成没有在本轮推进。
 | P9 | NOT_IMPLEMENTED | NOT_RUN | NOT_RUN | NOT_MEASURED |
 
 后续增加 target hidden/MTP prefill fixture、完整模型事务和 MTP driver。真实 draft 验证需要与 C7 residual rotation 一致的 MTP 权重，不能直接拼入原始 source 的未旋转 MTP。视觉、随机拒绝采样、服务集成及性能 gate 独立推进；现阶段不作真实 MTP 接受率或速度结论。

@@ -23,6 +23,7 @@ impl Mixer {
             position,
             index,
             trace,
+            rope_positions,
         } = *e;
         let h = c.hidden_size;
         let attended_width = match self {
@@ -108,11 +109,16 @@ impl Mixer {
                         &mut w.norm_temp[..rows * kv],
                     )?;
                     w.key[..rows * kv].copy_from_slice(&w.norm_temp[..rows * kv]);
-                    let positions: Vec<_> = (position..position + rows).map(|p| [p; 3]).collect();
-                    c.rope
-                        .apply(&mut w.query[..rows * q], c.num_attention_heads, &positions)?;
-                    c.rope
-                        .apply(&mut w.key[..rows * kv], c.num_key_value_heads, &positions)?;
+                    c.rope.apply(
+                        &mut w.query[..rows * q],
+                        c.num_attention_heads,
+                        rope_positions,
+                    )?;
+                    c.rope.apply(
+                        &mut w.key[..rows * kv],
+                        c.num_key_value_heads,
+                        rope_positions,
+                    )?;
                     trace.save(position, index, "query", &w.query[..rows * q])?;
                     trace.save(position, index, "key", &w.key[..rows * kv])?;
                     trace.save(position, index, "value", &w.value[..rows * kv])?;

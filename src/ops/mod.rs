@@ -5,3 +5,6 @@ pub mod causal_conv;
 pub mod gated_delta;
 pub mod norm;
 pub mod rope;
+
+pub mod gelu;
+pub mod vision_half;

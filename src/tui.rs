@@ -41,6 +41,7 @@ struct Conversation {
     messages: Vec<Value>,
     transcript: Vec<(String, String)>,
     input: String,
+    pending_images: Vec<String>,
     active: Option<GenerationHandle>,
     answer: String,
     status: String,
@@ -69,6 +70,7 @@ impl Conversation {
     fn reset(&mut self, system: &Option<String>) {
         self.active.take();
         self.messages.clear();
+        self.pending_images.clear();
         self.transcript.clear();
         self.answer.clear();
         self.scroll = 0;
@@ -100,8 +102,47 @@ impl Conversation {
             return;
         }
         self.input.clear();
-        self.messages.push(json!({"role":"user","content":input}));
-        self.transcript.push(("You".into(), input));
+        if let Some(path) = input.strip_prefix("/image ") {
+            if self.pending_images.len() >= crate::vision::MAX_IMAGES {
+                self.status = "At most 8 images per message".into();
+                return;
+            }
+            match crate::vision::data_url(std::path::Path::new(path.trim())) {
+                Ok(url) => {
+                    self.pending_images.push(url);
+                    self.status = format!(
+                        "{} image(s) attached to next message",
+                        self.pending_images.len()
+                    );
+                }
+                Err(e) => self.status = format!("Image error: {e}"),
+            }
+            return;
+        }
+        let content = if self.pending_images.is_empty() {
+            json!(input)
+        } else {
+            let mut parts: Vec<_> = self
+                .pending_images
+                .iter()
+                .map(|url| json!({"type":"image_url","image_url":{"url":url}}))
+                .collect();
+            parts.push(json!({"type":"text","text":input}));
+            json!(parts)
+        };
+        self.messages.push(json!({"role":"user","content":content}));
+        self.transcript.push((
+            "You".into(),
+            format!(
+                "{}{}",
+                if self.pending_images.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{} image(s)] ", self.pending_images.len())
+                },
+                input
+            ),
+        ));
         match engine.generate(GenerationRequest {
             prompt: Prompt::Chat {
                 messages: self.messages.clone(),
@@ -113,6 +154,7 @@ impl Conversation {
             stop: stop.to_vec(),
         }) {
             Ok(handle) => {
+                self.pending_images.clear();
                 self.active = Some(handle);
                 self.answer.clear();
                 self.transcript.push(("Assistant".into(), String::new()));
@@ -179,6 +221,7 @@ pub async fn chat(
         messages: vec![],
         transcript: vec![],
         input: String::new(),
+        pending_images: Vec::new(),
         active: None,
         answer: String::new(),
         status: String::new(),
@@ -282,7 +325,10 @@ pub async fn chat(
                     .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
                 panes[2],
             );
-            let footer = format!("{} · /reset · PgUp/PgDn · Ctrl+C exit", app.status);
+            let footer = format!(
+                "{} · /image PATH · /reset · PgUp/PgDn · Ctrl+C exit",
+                app.status
+            );
             frame.render_widget(
                 Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
                 panes[3],

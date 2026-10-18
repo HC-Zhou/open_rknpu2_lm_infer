@@ -22,7 +22,11 @@ mod ffi {
 use ffi::*;
 mod attention;
 pub use attention::Attention;
+mod floating;
+pub use floating::{FloatBackend, FloatLinear};
 mod policy;
+#[cfg(test)]
+mod vision_tests;
 
 #[cfg(test)]
 #[path = "npu/narrow_projection.rs"]
@@ -171,6 +175,7 @@ struct AttentionWork {
     k: Vec<u16>,
     v: Vec<u16>,
     output: Vec<f32>,
+    output_half: Vec<u16>,
 }
 struct Material {
     matrix: QuantMatrix,
@@ -440,6 +445,26 @@ impl Backend {
         dimension: usize,
         softmax_scale: f32,
     ) -> Result<Attention> {
+        self.attention_masked(query_heads, kv_heads, dimension, softmax_scale, false)
+    }
+    /// Full self attention, with a separate backend workspace from causal KV.
+    pub fn noncausal_attention(&self, heads: usize, dimension: usize) -> Result<Attention> {
+        self.attention_masked(
+            heads,
+            heads,
+            dimension,
+            (dimension as f32).sqrt().recip(),
+            true,
+        )
+    }
+    fn attention_masked(
+        &self,
+        query_heads: usize,
+        kv_heads: usize,
+        dimension: usize,
+        softmax_scale: f32,
+        noncausal: bool,
+    ) -> Result<Attention> {
         let mut b = self.0.borrow_mut();
         ensure!(
             kv_heads > 0
@@ -453,8 +478,11 @@ impl Backend {
             "native GQA requires Hq divisible by Hkv, Hkv within 1..32, D divisible by 32 and a positive softmax scale"
         );
         if b.attention.is_none() {
-            let config =
+            let mut config =
                 attention_config(&b.options, query_heads, kv_heads, dimension, softmax_scale);
+            if noncausal {
+                config.mask_mode = RK_NPU_ATTENTION_F16_NO_MASK;
+            }
             let mut sizes = rk_npu_attention_f16_sizes::default();
             check(
                 unsafe {
@@ -485,6 +513,7 @@ impl Backend {
                 k: vec![0; kv_heads * b.options.chunk * dimension],
                 v: vec![0; kv_heads * b.options.chunk * dimension],
                 output: vec![0.0; query_heads * config.max_query_rows as usize * dimension],
+                output_half: Vec::new(),
             });
         }
         let cfg = &b.attention.as_ref().unwrap().config;
@@ -492,7 +521,8 @@ impl Backend {
             cfg.query_heads as usize == query_heads
                 && cfg.kv_heads as usize == kv_heads
                 && cfg.head_dim as usize == dimension
-                && cfg.softmax_scale == softmax_scale,
+                && cfg.softmax_scale == softmax_scale
+                && (cfg.mask_mode == RK_NPU_ATTENTION_F16_NO_MASK) == noncausal,
             "attention workspace geometry mismatch"
         );
         let mut raw = ptr::null_mut();
@@ -1004,6 +1034,7 @@ mod tests {
             tune_search: false,
             tune_cache: cache.into(),
             attention_tile: 256,
+            vision_dtype: Default::default(),
         };
         configure_cpu(&mut options)?;
         Ok(options)
@@ -1076,7 +1107,7 @@ mod tests {
     #[test]
     #[ignore = "requires exclusive RK3588 NPU access"]
     fn quantized_linear_padding_and_swiglu() -> Result<()> {
-        let _lock = crate::engine::BoardLock::acquire()?;
+        let _lock = crate::validation::BoardLock::acquire()?;
         let cache = tempfile::tempdir()?;
         let mut options = options(cache.path())?;
         options.tune = true;
@@ -1141,7 +1172,7 @@ mod tests {
     #[test]
     #[ignore = "requires exclusive RK3588 NPU access"]
     fn native_gqa_append_and_layout() -> Result<()> {
-        let _lock = crate::engine::BoardLock::acquire()?;
+        let _lock = crate::validation::BoardLock::acquire()?;
         let cache = tempfile::tempdir()?;
         let mut options = options(cache.path())?;
         options.context = 512;
@@ -1319,7 +1350,7 @@ mod tests {
     #[test]
     #[ignore = "requires RK3588 NPU"]
     fn generic_attention_geometries_match_cpu() -> Result<()> {
-        let _lock = crate::engine::BoardLock::acquire()?;
+        let _lock = crate::validation::BoardLock::acquire()?;
         for (qh, kh, d, scale) in [
             (40, 8, 64, 1.0 / 64.0),
             (16, 2, 128, 1.0 / 128.0f32.sqrt()),

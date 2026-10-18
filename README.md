@@ -73,7 +73,9 @@
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
-An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. See the [C7 board validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) for checkpoint details and tested scope. MTP and multimodal execution are pending.
+An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. Qwen3.5 checkpoints with BF16 vision weights also support static images, multiple images and image history through the CLI, terminal chat and OpenAI chat API. See the [C7 text validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) and [vision usage and validation](llm_generated_docs/QWEN35_VISION_PROGRESS.md). MTP generation and video are pending.
+
+ViT uses FP16 intermediate tensors by default. Set `--vision-dtype fp32` to use FP32 intermediates and CPU arithmetic for numerical comparisons; NPU matmul remains FP16. The option applies to `run`, `chat`, `serve`, and the vision diagnostics in `tests/tools/`.
 
 ## Quick Start
 
@@ -105,6 +107,15 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ```
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
+
+For a Qwen3.5 checkpoint with vision weights, tune its visual encoder separately:
+
+```sh
+./bin/open_rknpu2_lm_infer -m MODEL tune --vision
+./bin/open_rknpu2_lm_infer -m MODEL tune --vision --image photo.jpg
+```
+
+The first command prepares common input sizes (256×256, 384×256 and 512×512). Repeat `--image` to prepare the actual resized dimensions of your images. Projection sizes come from the model configuration; text weights are not loaded. Use the same cache and CPU/NPU options for later inference. Ordinary inference only reads cached profiles and never starts a tuning search. `run`, `chat`, `serve` and `tune` do not acquire the global board test lock.
 
 ## Architecture
 

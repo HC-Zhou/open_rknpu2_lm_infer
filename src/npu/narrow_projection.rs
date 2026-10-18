@@ -3,7 +3,7 @@ use super::*;
 #[test]
 #[ignore = "requires exclusive RK3588 NPU access"]
 fn narrow_w8_gdn_gates_match_integer_oracle() -> Result<()> {
-    let _lock = crate::engine::BoardLock::acquire()?;
+    let _lock = crate::validation::BoardLock::acquire()?;
     let cache = tempfile::tempdir()?;
     let mut options = ModelOptions {
         path: cache.path().into(),
@@ -16,6 +16,7 @@ fn narrow_w8_gdn_gates_match_integer_oracle() -> Result<()> {
         tune_search: false,
         tune_cache: cache.path().into(),
         attention_tile: 512,
+        vision_dtype: Default::default(),
     };
     configure_cpu(&mut options)?;
     let backend = Backend::new(&options, 15)?;

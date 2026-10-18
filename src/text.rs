@@ -10,6 +10,7 @@ pub struct TextCodec {
     template: String,
     eos_token: Value,
     bos_token: Value,
+    images: Option<crate::vision::ImageProcessor>,
 }
 
 impl TextCodec {
@@ -32,6 +33,7 @@ impl TextCodec {
             template,
             eos_token: config["eos_token"].clone(),
             bos_token: config["bos_token"].clone(),
+            images: crate::vision::ImageProcessor::load(path)?,
         })
     }
 
@@ -83,6 +85,21 @@ impl TextCodec {
             .encode(formatted, false)
             .map_err(|e| anyhow!("encode prompt: {e}"))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    pub fn prepare(&self, prompt: &Prompt) -> Result<crate::input::PreparedInput> {
+        let images = match prompt {
+            Prompt::Chat { messages, .. } => {
+                crate::input::message_images(messages, self.images.as_ref())?
+            }
+            _ => Vec::new(),
+        };
+        let tokens = self.encode(prompt)?;
+        if let Some(processor) = &self.images {
+            crate::input::PreparedInput::expand(tokens, images, processor)
+        } else {
+            Ok(crate::input::PreparedInput::text(tokens))
+        }
     }
 
     pub fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String> {
@@ -156,6 +173,7 @@ mod tests {
             template: "{% if tools is not defined %}{% set tools = [] %}{% endif %}\n{% if tools is iterable and tools | length > 0 %}tools{% else %}plain{% endif %}".into(),
             eos_token: Value::Null,
             bos_token: Value::Null,
+            images: None,
         };
         assert_eq!(
             codec

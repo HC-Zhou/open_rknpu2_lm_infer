@@ -1,5 +1,19 @@
 # Third-party notices
 
+## Transformers vision references
+
+The Qwen3.5 image patch ordering, vision positions and encoder structure are
+implemented against the Qwen team / Hugging Face Transformers reference at
+revision `09281b8d56b08199ce9f397c694f38853cc45278` (Apache License 2.0).
+`scripts/qwen35/vision_reference.py` and the position checks execute selected
+original definitions with lightweight framework wrappers. Downloaded upstream
+files retain their copyright/license headers; they are not bundled here.
+Source URLs and hashes are in the vision evidence manifest. The Rust image
+resize implements the Pillow RGB bicubic arithmetic for processor parity.
+
+Copyright 2024-2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team.
+Upstream license: https://www.apache.org/licenses/LICENSE-2.0
+
 ## llama.cpp / ggml
 
 The FP32 gated delta recurrence in `native/cpu_kernels/`, called through

@@ -1,7 +1,7 @@
-use crate::{
-    engine::BoardLock,
-    model::{self, ModelOptions},
-};
+mod board_lock;
+pub use board_lock::BoardLock;
+
+use crate::model::{self, ModelOptions};
 use anyhow::{Result, ensure};
 use serde_json::json;
 use std::{

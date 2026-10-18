@@ -7,8 +7,6 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{File, OpenOptions},
-    os::fd::{AsRawFd, FromRawFd},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+mod context;
+use context::{PrefixCache, validate_request_tokens};
 
 #[derive(Debug, Clone)]
 pub enum Prompt {
@@ -75,7 +75,7 @@ impl std::fmt::Display for EngineBusy {
 impl std::error::Error for EngineBusy {}
 
 struct Job {
-    tokens: Vec<u32>,
+    input: crate::input::PreparedInput,
     request: GenerationRequest,
     events: mpsc::Sender<GenerationEvent>,
     cancel: Arc<AtomicBool>,
@@ -128,15 +128,14 @@ impl Engine {
             .name("rknpu-inference".into())
             .spawn(move || {
                 let loaded = (|| -> Result<_> {
-                    let lock = BoardLock::acquire()?;
                     let chunk = options.chunk;
                     let mut options = options;
                     options.tune_search = false;
                     let mut model = model::load(options)?;
                     model.prepare(chunk)?;
-                    Ok((lock, model))
+                    Ok(model)
                 })();
-                let (_lock, mut model) = match loaded {
+                let mut model = match loaded {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -201,7 +200,7 @@ impl Engine {
             .unwrap_or(Value::Null)
     }
     pub fn tokenize(&self, prompt: &Prompt) -> Result<Vec<u32>> {
-        self.inner.codec.encode(prompt)
+        Ok(self.inner.codec.prepare(prompt)?.tokens)
     }
     pub fn prompt_opens_thinking(&self, prompt: &Prompt) -> Result<bool> {
         Ok(matches!(prompt, Prompt::Chat { .. })
@@ -235,12 +234,12 @@ impl Engine {
             request.stop.iter().all(|stop| !stop.is_empty()),
             "stop sequences must not be empty"
         );
-        let tokens = self.tokenize(&request.prompt)?;
-        validate_request_tokens(&tokens, request.max_tokens, self.info())?;
+        let input = self.inner.codec.prepare(&request.prompt)?;
+        validate_request_tokens(&input.tokens, request.max_tokens, self.info())?;
         let (events_tx, events) = mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
         let job = Job {
-            tokens,
+            input,
             request,
             events: events_tx,
             cancel: cancel.clone(),
@@ -253,47 +252,6 @@ impl Engine {
                 Err(anyhow!("inference worker is unavailable"))
             }
         }
-    }
-}
-
-fn validate_request_tokens(tokens: &[u32], max_tokens: usize, info: &ModelInfo) -> Result<()> {
-    ensure!(!tokens.is_empty(), "prompt must contain at least one token");
-    ensure!(
-        tokens
-            .iter()
-            .all(|&token| (token as usize) < info.vocab_size),
-        "prompt contains a token outside the vocabulary"
-    );
-    ensure!(
-        tokens.len() <= info.context && max_tokens <= info.context - tokens.len(),
-        "requested {} prompt + {} completion tokens exceed context {}",
-        tokens.len(),
-        max_tokens,
-        info.context
-    );
-    Ok(())
-}
-
-#[derive(Default)]
-struct PrefixCache {
-    tokens: Vec<u32>,
-    logits: Vec<f32>,
-}
-impl PrefixCache {
-    fn clear(&mut self) {
-        self.tokens.clear();
-        self.logits.clear();
-    }
-    fn reusable(&self, tokens: &[u32], position: usize) -> usize {
-        if self.tokens.len() != position || tokens.is_empty() {
-            return 0;
-        }
-        self.tokens
-            .iter()
-            .zip(tokens)
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(tokens.len() - 1)
     }
 }
 
@@ -319,10 +277,10 @@ fn run_generation(
 ) -> Result<()> {
     let start = Instant::now();
     let queue_ms = job.queued.elapsed().as_secs_f64() * 1000.0;
-    let mut cached_tokens = cache.reusable(&job.tokens, model.position());
+    let mut cached_tokens = cache.reusable(&job.input, model.position());
     if cached_tokens > 0 && cached_tokens < model.position() {
         if model.truncate(cached_tokens)? {
-            cache.tokens.truncate(cached_tokens);
+            cache.truncate(cached_tokens);
         } else {
             cached_tokens = 0;
         }
@@ -331,9 +289,9 @@ fn run_generation(
         model.reset()?;
         cache.clear();
     }
-    let remaining = &job.tokens[cached_tokens..];
+    let remaining = &job.input.tokens[cached_tokens..];
     let prepare_start = Instant::now();
-    model.reserve(job.tokens.len() + job.request.max_tokens)?;
+    model.reserve(job.input.tokens.len() + job.request.max_tokens)?;
     if !remaining.is_empty() {
         model.prepare(remaining.len())?;
     }
@@ -341,16 +299,18 @@ fn run_generation(
     let prefill_start = Instant::now();
     if !remaining.is_empty() {
         cache.logits.clear();
-        cache
-            .logits
-            .extend_from_slice(model.forward_cancellable(remaining, &job.cancel)?);
-        cache.tokens.extend_from_slice(remaining);
+        cache.logits.extend_from_slice(model.forward_prepared(
+            &job.input,
+            cached_tokens,
+            &job.cancel,
+        )?);
+        cache.extend_input(&job.input, cached_tokens);
     }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let mut sampler = Sampler::new(
         job.request.sampling.clone(),
         model.info().vocab_size,
-        &job.tokens,
+        &job.input.tokens,
     )?;
     let mut filter = StopFilter::new(job.request.stop.clone())?;
     let mut decoder = codec.tokenizer.decode_stream(true);
@@ -395,7 +355,7 @@ fn run_generation(
                 .extend_from_slice(model.forward_cancellable(&[token], &job.cancel)?);
             decode_model_ms += call.elapsed().as_secs_f64() * 1000.0;
             decode_calls += 1;
-            cache.tokens.push(token);
+            cache.append_token(token);
         }
     }
     let tail = filter.finish();
@@ -407,7 +367,7 @@ fn run_generation(
     let result = GenerationResult {
         text,
         finish_reason: reason.into(),
-        prompt_tokens: job.tokens.len(),
+        prompt_tokens: job.input.tokens.len(),
         completion_tokens: generated,
         cached_tokens,
         timings: json!({"queue_ms":queue_ms,"prepare_ms":prepare_ms,"prefill_ms":prefill_ms,
@@ -426,69 +386,4 @@ fn run_generation(
         strategy_fallback_calls = %result.stats["strategy_fallback_calls"],
         strategy_fallbacks = %result.stats["strategy_fallbacks"], "generation finished");
     send_event(job, GenerationEvent::Finished(result))
-}
-
-/// Share the driver's submit lock with other processes and the board runner.
-pub struct BoardLock {
-    _file: File,
-}
-impl BoardLock {
-    pub fn acquire() -> Result<Self> {
-        let inherited = std::env::var("OPEN_RKNPU2_LOCK_FD")
-            .or_else(|_| std::env::var("LLM_INFER_LOCK_FD"))
-            .ok();
-        let file = if let Some(value) = inherited {
-            let fd: i32 = value
-                .parse()
-                .context("invalid inherited NPU lock descriptor")?;
-            let duplicate = unsafe { libc::dup(fd) };
-            ensure!(
-                duplicate >= 0,
-                "cannot duplicate NPU lock descriptor: {}",
-                std::io::Error::last_os_error()
-            );
-            unsafe { File::from_raw_fd(duplicate) }
-        } else {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/rknpu_lowlevel_submit.lock")?
-        };
-        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        ensure!(
-            status == 0,
-            "NPU is in use: /tmp/rknpu_lowlevel_submit.lock"
-        );
-        Ok(Self { _file: file })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn prefix_cache_reuses_common_prefix_and_recomputes_last_logit() {
-        let cache = PrefixCache {
-            tokens: vec![1, 2, 3],
-            logits: vec![],
-        };
-        assert_eq!(cache.reusable(&[1, 2, 3, 4], 3), 3);
-        assert_eq!(cache.reusable(&[1, 2, 4], 3), 2);
-        assert_eq!(cache.reusable(&[1, 2], 3), 1);
-        assert_eq!(cache.reusable(&[1, 2, 3], 3), 2);
-        assert_eq!(cache.reusable(&[1, 2, 3], 2), 0);
-    }
-    #[test]
-    fn context_reserves_completion_before_queueing() {
-        let info = ModelInfo {
-            id: "test".into(),
-            architecture: "test".into(),
-            context: 4,
-            vocab_size: 10,
-            eos_tokens: vec![9],
-        };
-        assert!(validate_request_tokens(&[1, 2], 2, &info).is_ok());
-        assert!(validate_request_tokens(&[1, 2], 3, &info).is_err());
-        assert!(validate_request_tokens(&[10], 0, &info).is_err());
-    }
 }

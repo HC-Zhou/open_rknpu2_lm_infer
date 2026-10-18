@@ -30,7 +30,11 @@ impl Qwen35 {
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
             "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
             "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":false,
-            "multimodal_enabled":false,"prefix_truncate":"reset/recompute for shorter nonzero prefixes",
+            "multimodal_enabled":self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":self.vision.is_some(),"next_rope_position":self.next_rope_position,
+            "vision_encoder_calls":self.vision.as_ref().map_or(0,|v|v.calls),"vision_cache_hits":self.vision.as_ref().map_or(0,|v|v.hits),
+            "vision_dtype":self.options.vision_dtype.as_str(),
+            "vision_encoder_ms":self.vision.as_ref().map_or(0.0,|v|v.elapsed_ms),"vision_feature_cache_bytes":self.vision.as_ref().map_or(0,|v|v.cache_bytes()),
+            "prefix_truncate":"reset/recompute for shorter nonzero prefixes",
             "trace_directory":self.trace.path(),"attention_tile":self.options.attention_tile,
             "tuning_enabled":self.options.tune,"tuning_search_enabled":self.options.tune_search,"tune_cache":self.options.tune_cache,
             "activation_quantization":"full-K maxabs/127, round-away, clamp[-127,127]"

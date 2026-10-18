@@ -23,6 +23,7 @@ pub(super) struct Execution<'a> {
     pub position: usize,
     pub index: i32,
     pub trace: &'a Trace,
+    pub rope_positions: &'a [[usize; 3]],
 }
 
 pub(super) enum Mixer {
@@ -137,6 +138,7 @@ impl Layer {
             position,
             index,
             trace,
+            ..
         } = *e;
         let h = c.hidden_size;
         timings.measure(Phase::Cpu, || {

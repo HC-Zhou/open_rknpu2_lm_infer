@@ -12,6 +12,22 @@ pub(crate) mod projection;
 pub mod qwen35;
 pub(crate) mod trace;
 
+/// ViT activation storage and CPU arithmetic. NPU GEMMs remain FP16 in both modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum VisionDtype {
+    #[default]
+    Fp16,
+    Fp32,
+}
+impl VisionDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Fp32 => "fp32",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelOptions {
     pub path: PathBuf,
@@ -25,6 +41,7 @@ pub struct ModelOptions {
     pub tune_search: bool,
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
+    pub vision_dtype: VisionDtype,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +69,21 @@ pub trait LanguageModel {
         anyhow::bail!("this model has no head-free prefill implementation")
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]>;
+    /// Consume a suffix of a prepared prompt. The worker owns all model/device
+    /// state; image decoding and token expansion have already completed.
+    fn forward_prepared(
+        &mut self,
+        input: &crate::input::PreparedInput,
+        start: usize,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<&[f32]> {
+        anyhow::ensure!(
+            input.images.is_empty(),
+            "this model does not support images"
+        );
+        anyhow::ensure!(start < input.tokens.len(), "empty prepared suffix");
+        self.forward_cancellable(&input.tokens[start..], cancelled)
+    }
     fn forward_cancellable(
         &mut self,
         tokens: &[u32],

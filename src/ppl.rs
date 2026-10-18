@@ -1,6 +1,6 @@
 use crate::{
-    engine::BoardLock,
     model::{self, ModelOptions},
+    validation::BoardLock,
 };
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};

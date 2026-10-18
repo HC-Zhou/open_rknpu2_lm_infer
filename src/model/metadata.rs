@@ -28,6 +28,7 @@ pub(crate) fn inspect(path: &Path, requested_context: usize) -> Result<Value> {
         "layers":text["num_hidden_layers"],"hidden_size":text["hidden_size"],"attention_heads":text["num_attention_heads"],
         "kv_heads":text["num_key_value_heads"],"vocab_size":text["vocab_size"],"max_position_embeddings":text["max_position_embeddings"],
         "quantization_config":config.get("quantization_config").or_else(|| text.get("quantization_config")),
+        "vision_config":config.get("vision_config"),
         "chat_template":path.join("chat_template.jinja").exists() || tokenizer.get("chat_template").is_some(),"requested_context":requested_context}),
     )
 }

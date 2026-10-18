@@ -2,6 +2,12 @@
 
 日期：2026-10-17，Asia/Shanghai。
 
+2026-10-18视觉扩展：通用输入、图像预处理、LayerNorm/GELU、FP16 Linear分别新增于 `input.rs`、`vision/`、`layers/layer_norm.rs` / `ops/gelu.rs`、`npu/floating.rs`；Qwen3.5目录只放ViT配置/权重/编排。API请求解析及前缀身份管理分别拆至 `api/request.rs`、`engine/context.rs`，视觉功能与验证版本边界见 [视觉记录](QWEN35_VISION_PROGRESS.md)。下文重构数字与验证是10月17日的历史记录。
+
+独立测试和诊断工具源码统一放在 `tests/tools/`，通过 Cargo.toml 显式注册，沿用 `--example NAME` 构建/运行入口；默认测试不执行这些需要外部数据或设备的程序。历史消融和插桩工具移至 `scripts/archive/`，目录与依赖见 [FP16/ViT 实验归档](FP16_VIT_EXPERIMENT_ARCHIVE.md)。
+
+ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，使用 Rust NEON/窄范围内联汇编及模型自身的 Rayon 线程池。此前新增的 `native/cpu_kernels/vision.cpp`、`vision_rotary.cpp` 和对应 FFI 已移除；`native/cpu_kernels/` 只保留已有的 GDN 内核。
+
 本轮将 Qwen3.5 接入时放在模型目录内的公共实现提取出来。依赖方向为模型适配层 → 可复用层 → 数值算子；公共算子和 GDN 层不导入模型配置、checkpoint、NPU backend 或 engine。
 
 | 目录/模块 | 职责与边界 |
@@ -24,7 +30,7 @@
 
 公共测试入口为 `tests/cpu_layers.rs` / `tests/cpu_layers/`，仅通过 `ops`、`layers` API 测试算子和状态；Qwen 的配置和 Q/gate 布局测试留在模型内。现有 Transformers fixture 位于 `evidence/qwen35_mtp/`，保留生成来源，并不要求公共实现依赖 Qwen 模型。
 
-独立工具入口为 `examples/gdn_bench.rs`、`scripts/gdn/ggml_reference/`、`scripts/gdn/cpu_reference/`、`scripts/gdn/check_case.py`、`export_cases.py` 和 `summarize.py`。原11个 NPZ、CPU 源码快照与历史性能记录保持原哈希；NPU kernel 实验可继续使用原数据包，新维护入口见 [GDN 复现说明](QWEN35_GDN_KERNEL_REPRO.md)。
+独立工具入口为 `tests/tools/gdn_bench.rs`、`scripts/gdn/ggml_reference/`、`scripts/gdn/cpu_reference/`、`scripts/gdn/check_case.py`、`export_cases.py` 和 `summarize.py`。原11个 NPZ、CPU 源码快照与历史性能记录保持原哈希；NPU kernel 实验可继续使用原数据包，新维护入口见 [GDN 复现说明](QWEN35_GDN_KERNEL_REPRO.md)。
 
 Qwen3.5 模型目录由21个 Rust 文件、2,857行缩至12个文件、1,510行；本次重组的算子、GDN 层、输出头、trace 与剩余 Qwen 模块均不超过275行。
 

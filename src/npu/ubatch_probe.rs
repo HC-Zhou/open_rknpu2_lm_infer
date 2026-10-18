@@ -6,7 +6,7 @@ use std::{path::PathBuf, time::Instant};
 #[test]
 #[ignore = "requires RKNPU_MODEL and exclusive RK3588 NPU access"]
 fn real_weight_ubatch_probe() -> Result<()> {
-    let _lock = crate::engine::BoardLock::acquire()?;
+    let _lock = crate::validation::BoardLock::acquire()?;
     let batches = std::env::var("RKNPU_PROBE_BATCHES")
         .unwrap_or_else(|_| "64,128,256".into())
         .split(',')
@@ -54,6 +54,7 @@ fn real_weight_ubatch_probe() -> Result<()> {
         tune_search: false,
         tune_cache: PathBuf::new(),
         attention_tile: 512,
+        vision_dtype: Default::default(),
     };
     configure_cpu(&mut options)?;
     let ctx = Handle::new(unsafe { rk_npu_open(ptr::null()) }, rk_npu_close, "NPU")?;
@@ -232,7 +233,7 @@ fn real_weight_ubatch_probe() -> Result<()> {
 #[test]
 #[ignore = "requires RKNPU_MODEL and exclusive RK3588 NPU access"]
 fn large_ubatch_model_sweep() -> Result<()> {
-    let _lock = crate::engine::BoardLock::acquire()?;
+    let _lock = crate::validation::BoardLock::acquire()?;
     let path = PathBuf::from(std::env::var_os("RKNPU_MODEL").context("set RKNPU_MODEL")?);
     let report =
         PathBuf::from(std::env::var_os("RKNPU_UBATCH_REPORT").context("set RKNPU_UBATCH_REPORT")?);
@@ -260,6 +261,7 @@ fn large_ubatch_model_sweep() -> Result<()> {
             tune_search: true,
             tune_cache: cache.clone(),
             attention_tile: 512,
+            vision_dtype: Default::default(),
         })?;
         model.reserve(tokens.len() + continuation.len())?;
         let loaded_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -345,7 +347,7 @@ fn large_ubatch_model_sweep() -> Result<()> {
 #[test]
 #[ignore = "requires exclusive RK3588 NPU access"]
 fn large_ubatch_attention_splitting() -> Result<()> {
-    let _lock = crate::engine::BoardLock::acquire()?;
+    let _lock = crate::validation::BoardLock::acquire()?;
     let mut options = ModelOptions {
         path: PathBuf::new(),
         context: 512,
@@ -357,6 +359,7 @@ fn large_ubatch_attention_splitting() -> Result<()> {
         tune_search: false,
         tune_cache: PathBuf::new(),
         attention_tile: 512,
+        vision_dtype: Default::default(),
     };
     configure_cpu(&mut options)?;
     let full_backend = Backend::new(&options, 15)?;

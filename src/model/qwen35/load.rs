@@ -271,5 +271,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         head_ms: 0.0,
         phases: Default::default(),
         mtp_available,
+        vision: None,
+        next_rope_position: 0,
     })
 }

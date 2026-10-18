@@ -2,8 +2,8 @@
 use anyhow::{Result, ensure};
 use clap::Parser;
 use open_rknpu2_lm_infer::{
-    engine::BoardLock,
     model::{self, LanguageModel, ModelOptions},
+    validation::BoardLock,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -108,6 +108,7 @@ fn main() -> Result<()> {
         tune_search: false,
         tune_cache: args.report.with_extension("cache"),
         attention_tile: 512,
+        vision_dtype: Default::default(),
     })?;
     let mut checks = Vec::new();
     let mut passed = true;

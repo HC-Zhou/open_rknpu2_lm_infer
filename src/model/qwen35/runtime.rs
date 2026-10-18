@@ -1,6 +1,7 @@
 use super::{
     config::Config,
     decoder::{Buffers, Execution, Layer, Mixer},
+    multimodal::EmbeddedChunk,
     timings::{Phase, Timings},
 };
 use crate::model::trace::Trace;
@@ -43,6 +44,8 @@ pub struct Qwen35 {
     pub(super) head_ms: f64,
     pub(super) phases: Timings,
     pub(super) mtp_available: bool,
+    pub(super) vision: Option<super::vision::Encoder>,
+    pub(super) next_rope_position: usize,
 }
 
 impl Qwen35 {
@@ -50,7 +53,7 @@ impl Qwen35 {
         super::load::load(options)
     }
 
-    fn check_input(&self, tokens: &[u32]) -> Result<()> {
+    pub(super) fn check_input(&self, tokens: &[u32]) -> Result<()> {
         ensure!(
             !tokens.is_empty() && tokens.len() <= self.options.context - self.position,
             "empty Qwen3.5 input or context capacity exceeded"
@@ -62,7 +65,12 @@ impl Qwen35 {
         Ok(())
     }
 
-    fn chunk(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<()> {
+    pub(super) fn chunk(
+        &mut self,
+        tokens: &[u32],
+        cancelled: Option<&AtomicBool>,
+        prepared: Option<EmbeddedChunk<'_>>,
+    ) -> Result<()> {
         let start = Instant::now();
         let h = self.config.hidden_size;
         self.phases.measure(Phase::Cpu, || {
@@ -73,6 +81,29 @@ impl Qwen35 {
                 );
             }
         });
+        let positions: Vec<_>;
+        let rope_positions = if let Some(EmbeddedChunk {
+            positions: p,
+            features,
+        }) = prepared
+        {
+            ensure!(p.len() == tokens.len(), "prepared position shape mismatch");
+            for (start, embedding) in features {
+                let end = start + embedding.len() / h;
+                let first = self.position.max(*start);
+                let last = (self.position + tokens.len()).min(end);
+                if first < last {
+                    self.work.hidden[(first - self.position) * h..(last - self.position) * h]
+                        .copy_from_slice(&embedding[(first - start) * h..(last - start) * h]);
+                }
+            }
+            p
+        } else {
+            positions = (self.next_rope_position..self.next_rope_position + tokens.len())
+                .map(|p| [p; 3])
+                .collect();
+            &positions
+        };
         for (i, layer) in self.layers.iter_mut().enumerate() {
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -87,11 +118,19 @@ impl Qwen35 {
                     position: self.position,
                     index: i as i32,
                     trace: &self.trace,
+                    rope_positions,
                 },
                 &mut self.phases,
             )?;
         }
         self.position += tokens.len();
+        self.next_rope_position = rope_positions
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(self.next_rope_position)
+            + 1;
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
@@ -107,7 +146,7 @@ impl Qwen35 {
         let result = (|| {
             let mut rows = 0;
             for chunk in tokens.chunks(self.options.chunk) {
-                self.chunk(chunk, cancelled)?;
+                self.chunk(chunk, cancelled, None)?;
                 rows = chunk.len();
             }
             ensure!(
@@ -140,7 +179,7 @@ impl Qwen35 {
             .chunks(self.options.chunk)
             .zip(targets.chunks(self.options.chunk))
         {
-            self.chunk(tokens, None)?;
+            self.chunk(tokens, None, None)?;
             let start = Instant::now();
             let h = self.config.hidden_size;
             let rows = tokens.len();
@@ -184,6 +223,7 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.position = 0;
+        self.next_rope_position = 0;
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
         self.phases = Timings::default();
@@ -243,6 +283,15 @@ impl LanguageModel for Qwen35 {
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         self.forward_impl(tokens, None, true)?;
+        Ok(&self.logits)
+    }
+    fn forward_prepared(
+        &mut self,
+        input: &crate::input::PreparedInput,
+        start: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<&[f32]> {
+        self.consume_prepared(input, start, cancelled)?;
         Ok(&self.logits)
     }
     fn forward_cancellable(&mut self, tokens: &[u32], cancelled: &AtomicBool) -> Result<&[f32]> {

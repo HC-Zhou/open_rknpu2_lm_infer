@@ -106,6 +106,15 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
 
+含视觉权重的 Qwen3.5 模型可以单独调优视觉编码器：
+
+```sh
+./bin/open_rknpu2_lm_infer -m MODEL tune --vision
+./bin/open_rknpu2_lm_infer -m MODEL tune --vision --image photo.jpg
+```
+
+第一条命令准备 256×256、384×256、512×512 三档常用输入；也可重复传入 `--image`，按图片实际预处理后的尺寸准备。投影维度从模型配置读取，不加载文本权重。后续推理使用相同缓存和 CPU/NPU 参数；普通推理只读缓存，不在线搜索。ViT 默认使用 FP16 中间张量，需要精度对照时传 `--vision-dtype fp32`，NPU 矩阵乘仍为 FP16。`run`、`chat`、`serve` 和 `tune` 不获取全局板端测试锁。
+
 ## 架构
 
 ```

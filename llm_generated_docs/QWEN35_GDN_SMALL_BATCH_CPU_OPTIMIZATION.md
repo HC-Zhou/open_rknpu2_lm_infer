@@ -51,7 +51,7 @@ C7 recurrence窗口1/2/4/7/8/128，在1/4线程下的输出与最终state均与�
 
 ## 复现入口
 
-- [`examples/gdn_small_bench.rs`](../examples/gdn_small_bench.rs)：Rust recurrence完整调用，默认24层；`--mixer` 使用 [`mixer.rs`](../examples/gdn_small_bench/mixer.rs) 测完整CPU层，覆盖 M=1..8。
+- [`tests/tools/gdn_small_bench.rs`](../tests/tools/gdn_small_bench.rs)：Rust recurrence完整调用，默认24层；`--mixer` 使用 [`mixer.rs`](../tests/tools/gdn_small_bench/mixer.rs) 测完整CPU层，覆盖 M=1..8。
 - [`scripts/gdn/bench_small_batch.py`](../scripts/gdn/bench_small_batch.py)：C ABI共享库的ABBA比较，可分别测复制/原地/output-free replay。
 - 固定数值参考来自 [既有GDN oracle包](evidence/qwen35_gdn_kernel_20261017/)。本轮的 `fixtures-manifest.json` 记录原始NPZ及紧凑FP32文件布局。
 
