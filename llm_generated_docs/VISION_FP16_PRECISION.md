@@ -2,6 +2,8 @@
 
 2026-10-18。区分张量存储精度、算子内部累加精度和算子之间的舍入位置。FP16 matmul的输入/输出并不能决定整个Transformer块的精度。
 
+后续更新：以下为融合GELU前的冻结精度实验。当前FFN默认使用NPU GEMM/bias/GELU融合，CPU近似GELU已删除；`--vision-dtype fp32`只恢复FP32张量存储，两种模式均融合FFN，不能复现下表的旧CPU FFN路径。[当前实现与精度](NPU_FFN_GELU_RESEARCH.md)。
+
 ## 严格FP32参考下的结果
 
 本轮精度结论只比较ViT输出。参考使用同一C7视觉权重，全部参数和激活以PyTorch CUDA FP32计算；TF32/autocast关闭、matmul precision=highest、SDPA固定MATH。全部模块浮点输出dtype审计通过。输入patches与板端逐位一致。数据、设置和原始checkpoint坐标对齐见[FP32参考记录](evidence/vision_fp32_gold_20261018/README.md)。
@@ -61,7 +63,7 @@
 
 单独恢复残差或GELU并不保证每张图都更接近FP32；例如蓝图联合恢复后比旧实现的0.7363%更近。不同误差方向经过后续非线性和归一化会放大或抵消，不能依据单个距离做可加的贡献分摊。norm两种实现均用FP32归约，求和顺序改变后又写入FP16也会产生不同后续轨迹；红图norm32相对当前FP16的features距离为0.8453%，尽管两者到旧实现的距离接近。
 
-红图当前FP16相对旧实现的层间距离：patch/position0.0291%、block0为0.0694%、block7为0.3094%、block15为0.8179%、block23为2.1679%，merger后1.5560%。该轨迹说明差异逐步累积，不单独证明某一算子是唯一主因。原始逐层数据与构建副本见[消融记录](evidence/vision_fp16_precision_20261018/summary.json)。局部混合精度只用于诊断；正式配置默认FP16，可通过`--vision-dtype fp32`手动选择整个ViT的旧FP32中间张量路径。
+红图当前FP16相对旧实现的层间距离：patch/position0.0291%、block0为0.0694%、block7为0.3094%、block15为0.8179%、block23为2.1679%，merger后1.5560%。该轨迹说明差异逐步累积，不单独证明某一算子是唯一主因。原始逐层数据与构建副本见[消融记录](evidence/vision_fp16_precision_20261018/summary.json)。局部混合精度只用于诊断；当时通过`--vision-dtype fp32`选择旧FP32张量路径，当前FFN融合后的行为见页首更新。
 
 完整性能见[VISION_FP16_STORAGE.md](VISION_FP16_STORAGE.md)。这些诊断比较数值距离，不代表任务准确率；本轮不使用文本端的量化误差评价ViT。
 

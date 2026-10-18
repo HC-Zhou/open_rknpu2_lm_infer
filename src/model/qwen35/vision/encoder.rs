@@ -164,10 +164,8 @@ impl Encoder {
             stages.mark("residual1");
             T::norm(&block.norm2, pool, &hidden, &mut normalized)?;
             stages.mark("norm2");
-            T::linear(&block.fc1, &normalized, &mut ff, rows)?;
-            stages.mark("mlp_up_linear");
-            T::gelu(pool, &mut ff, true);
-            stages.mark("gelu");
+            T::linear_gelu(&block.fc1, pool, &normalized, &mut ff, rows)?;
+            stages.mark("mlp_up_gelu");
             T::linear(&block.fc2, &ff, &mut projected, rows)?;
             stages.mark("mlp_down_linear");
             T::add(pool, &mut hidden, &projected)?;
@@ -182,7 +180,7 @@ impl Encoder {
         stages.mark("merger_allocation");
         T::linear(&w.merger.fc1, &normalized, &mut temp, merged)?;
         stages.mark("merger_fc1");
-        T::gelu(pool, &mut temp, false);
+        T::merger_gelu(pool, &mut temp);
         stages.mark("merger_gelu");
         let mut features = vec![T::default(); merged * c.out];
         T::linear(&w.merger.fc2, &temp, &mut features, merged)?;

@@ -21,11 +21,11 @@ fn fp16_parallel_operations_match_across_thread_counts() -> Result<()> {
     let input: Vec<_> = (0..129 * 1024)
         .map(|i| f16::from_f32(((i * 37 % 257) as f32 - 128.) * 0.013).to_bits())
         .collect();
-    for approximate in [false, true] {
+    {
         let mut a = input.clone();
         let mut b = a.clone();
-        gelu(&single, &mut a, approximate);
-        gelu(&parallel, &mut b, approximate);
+        gelu(&single, &mut a);
+        gelu(&parallel, &mut b);
         assert_eq!(a, b);
         add(&parallel, &mut b, &input)?;
         for ((x, y), actual) in a.iter().zip(&input).zip(b) {
@@ -100,18 +100,14 @@ fn fp16_norm_keeps_large_reductions_finite() -> Result<()> {
 #[test]
 fn fp16_gelu_and_residual_match_rounded_reference() -> Result<()> {
     let input: Vec<_> = (0..259).map(|i| (i as f32 - 129.) / 16.).collect();
-    for approximate in [false, true] {
+    {
         let mut values = narrow(&input);
-        gelu(&pool(), &mut values, approximate);
+        gelu(&pool(), &mut values);
         for (&x, y) in input.iter().zip(widen(&values)) {
-            let reference = if approximate {
-                0.5 * x * (1. + (0.7978846 * (x + 0.044715 * x * x * x)).tanh())
-            } else {
-                unsafe extern "C" {
-                    fn erff(x: f32) -> f32;
-                }
-                0.5 * x * (1. + unsafe { erff(x * std::f32::consts::FRAC_1_SQRT_2) })
-            };
+            unsafe extern "C" {
+                fn erff(x: f32) -> f32;
+            }
+            let reference = 0.5 * x * (1. + unsafe { erff(x * std::f32::consts::FRAC_1_SQRT_2) });
             assert!((y - f16::from_f32(reference).to_f32()).abs() < 0.004);
         }
         let original = widen(&values);

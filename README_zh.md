@@ -113,7 +113,7 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer -m MODEL tune --vision --image photo.jpg
 ```
 
-第一条命令准备 256×256、384×256、512×512 三档常用输入；也可重复传入 `--image`，按图片实际预处理后的尺寸准备。投影维度从模型配置读取，不加载文本权重。后续推理使用相同缓存和 CPU/NPU 参数；普通推理只读缓存，不在线搜索。ViT 默认使用 FP16 中间张量，需要精度对照时传 `--vision-dtype fp32`，NPU 矩阵乘仍为 FP16。`run`、`chat`、`serve` 和 `tune` 不获取全局板端测试锁。
+第一条命令准备 256×256、384×256、512×512 三档常用输入；也可重复传入 `--image`，按图片实际预处理后的尺寸准备。投影维度从模型配置读取，不加载文本权重。后续推理使用相同缓存和 CPU/NPU 参数；普通推理只读缓存，不在线搜索。ViT 默认使用 FP16 中间张量，FFN 使用 NPU GEMM + bias + 近似 GELU 融合；旧 CPU 近似 GELU 路径已删除。需要张量精度对照时传 `--vision-dtype fp32`，FFN 融合和 FP16 NPU 矩阵乘仍然启用。LayerNorm/softmax 内部用 FP32 累加，merger 保留模型规定的 erf GELU。[融合性能与精度记录](llm_generated_docs/NPU_FFN_GELU_RESEARCH.md)。`run`、`chat`、`serve` 和 `tune` 不获取全局板端测试锁。
 
 ## 架构
 

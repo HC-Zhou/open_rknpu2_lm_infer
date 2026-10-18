@@ -1,11 +1,14 @@
 //! Static floating Linear through the public FP16/BF16 MM ABI. Ordinary calls
 //! load shape profiles; explicit preparation can search complete host calls.
 use super::*;
+#[path = "floating_gelu.rs"]
+mod gelu;
 #[cfg(test)]
 #[path = "floating_tests.rs"]
 mod tests;
 
 struct FloatWork {
+    gelu: Option<Handle<rk_npu_mm_gelu_workspace>>,
     workspace: Handle<rk_npu_mm_tuned_workspace>,
     strategy: rk_npu_mm_strategy,
 }
@@ -175,6 +178,7 @@ impl FloatBackend {
         works.insert(
             (k, n),
             FloatWork {
+                gelu: None,
                 workspace: Handle::new(raw, rk_npu_mm_tuned_workspace_free, "floating workspace")?,
                 strategy,
             },
@@ -279,6 +283,79 @@ impl FloatLinear {
             "Linear requires FP16 storage IO"
         );
         self.run_typed(input, output, rows)
+    }
+    /// Fused NPU GEMM, channel bias and tanh GELU; direct FP16 collection.
+    pub fn run_half_gelu(
+        &self,
+        pool: &rayon::ThreadPool,
+        input: &[u16],
+        output: &mut [u16],
+        rows: usize,
+    ) -> Result<()> {
+        self.with_gelu_view(input, rows, |view| gelu::collect_half(pool, view, output))
+    }
+    /// FP32 activation storage keeps the same fused NPU FFN operation.
+    pub fn run_gelu(
+        &self,
+        pool: &rayon::ThreadPool,
+        input: &[f32],
+        output: &mut [f32],
+        rows: usize,
+    ) -> Result<()> {
+        let input = crate::ops::vision_half::narrow(input);
+        self.with_gelu_view(&input, rows, |view| gelu::collect_float(pool, view, output))
+    }
+    fn with_gelu_view(
+        &self,
+        input: &[u16],
+        rows: usize,
+        collect: impl FnOnce(&rk_npu_mm_gelu_view) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.owner.dtype == RK_NPU_MM_F16,
+            "fused GELU requires FP16 weights"
+        );
+        ensure!(
+            rows > 0 && rows.checked_mul(self.k) == Some(input.len()),
+            "fused GELU input shape mismatch"
+        );
+        self.prepare(rows)?;
+        let mut works = self.owner.work.borrow_mut();
+        let w = works.get_mut(&(self.k, self.n)).unwrap();
+        if w.gelu.is_none() {
+            let device = self.owner.device.0.borrow();
+            let mut cfg = rk_npu_mm_gelu_config::default();
+            unsafe {
+                rk_npu_mm_gelu_config_init(&mut cfg, rows as i32, self.n as i32, self.k as i32)
+            };
+            cfg.core_mask = device.options.npu_mask;
+            let mut raw = ptr::null_mut();
+            check(
+                unsafe { rk_npu_mm_gelu_prepare(device.domain.raw, &cfg, &mut raw) },
+                "fused GELU workspace",
+            )?;
+            w.gelu = Some(Handle::new(
+                raw,
+                rk_npu_mm_gelu_free,
+                "fused GELU workspace",
+            )?);
+        }
+        let mut view = rk_npu_mm_gelu_view::default();
+        check(
+            unsafe {
+                rk_npu_mm_gelu_run_weights(
+                    w.gelu.as_ref().unwrap().raw,
+                    input.as_ptr(),
+                    std::mem::size_of_val(input) as u64,
+                    self.weight.raw,
+                    self.bias.as_ptr(),
+                    &mut view,
+                )
+            },
+            "fused GELU run",
+        )?;
+        // Keep the shared workspace borrowed until collection finishes.
+        collect(&view)
     }
     // Only the two typed entrypoints above choose host storage. The ABI accepts
     // either representation with byte lengths; preparation and execution agree.

@@ -150,11 +150,9 @@ fn vision_math_matches_pinned_transformers() -> Result<()> {
     let mut out = vec![0.0; input.len()];
     norm.run(&pool, &input, &mut out)?;
     compare(&out, &values("norm_output"));
-    for (approximate, key) in [(false, "gelu_exact"), (true, "gelu_tanh")] {
-        let mut out = values("gelu_input");
-        gelu::apply(&pool, &mut out, approximate);
-        compare(&out, &values(key));
-    }
+    let mut out = values("gelu_input");
+    gelu::apply(&pool, &mut out);
+    compare(&out, &values("gelu_exact"));
     let positions = math::patch_positions(2, 4);
     assert_eq!(
         positions,

@@ -2,7 +2,7 @@
 
 **后续更新（2026-10-18）**：通用自动调优已落地；ViT现使用FP16激活张量、FP32 LayerNorm/softmax归约和默认FP16 K partial＋NPU FP16 Add tree。三档21个HOST_STORAGE shape已重新搜索；完整性能与精度偏移见[VISION_FP16_STORAGE.md](VISION_FP16_STORAGE.md)。下文是改造前固定FP32 host接口基线，保留为历史对照。
 
-运行时默认`--vision-dtype fp16`，可手动`--vision-dtype fp32`切回FP32中间张量/CPU计算，NPU GEMM仍为FP16。Rust入口为`ModelOptions::vision_dtype`；通过参数选择，没有对应环境变量。
+运行时默认`--vision-dtype fp16`，可手动`--vision-dtype fp32`选择FP32中间张量，NPU GEMM仍为FP16。两种存储模式的FFN均默认使用GEMM/bias/GELU融合，旧CPU近似GELU已删除；merger仍用erf GELU。Rust入口为`ModelOptions::vision_dtype`；通过参数选择，没有对应环境变量。[融合实现与验证](NPU_FFN_GELU_RESEARCH.md)。
 
 2026-10-18。FP16 通用调优由另一 agent 负责；本轮固定默认配置作为正确性基线。共享工作树的 wrapper 和算子库后续由另一 agent 更新；此处描述实测基线，不覆盖其新调优版本。
 

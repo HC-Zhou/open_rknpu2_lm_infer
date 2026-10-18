@@ -49,28 +49,22 @@ pub fn add(pool: &ThreadPool, output: &mut [u16], input: &[u16]) -> Result<()> {
     Ok(())
 }
 #[inline]
-fn gelu_value(x: f32, approximate: bool) -> f32 {
-    if approximate {
-        // Preserve the fused cubic used by the former GCC kernel.
-        let cubic = (0.044715 * x * x).mul_add(x, x);
-        0.5 * x * (1. + (0.797_884_6 * cubic).tanh())
-    } else {
-        0.5 * x * (1. + crate::ops::gelu::erf(x * std::f32::consts::FRAC_1_SQRT_2))
-    }
+fn gelu_value(x: f32) -> f32 {
+    0.5 * x * (1. + crate::ops::gelu::erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
-pub fn gelu(pool: &ThreadPool, values: &mut [u16], approximate: bool) {
+pub fn gelu(pool: &ThreadPool, values: &mut [u16]) {
     let run = |values: &mut [u16]| {
         let mut blocks = values.chunks_exact_mut(8);
         for block in &mut blocks {
             let mut lanes = [0.; 8];
             convert::widen(block, &mut lanes);
             for x in &mut lanes {
-                *x = gelu_value(*x, approximate);
+                *x = gelu_value(*x);
             }
             convert::narrow(&lanes, block);
         }
         for x in blocks.into_remainder() {
-            *x = f16::from_f32(gelu_value(f16::from_bits(*x).to_f32(), approximate)).to_bits();
+            *x = f16::from_f32(gelu_value(f16::from_bits(*x).to_f32())).to_bits();
         }
     };
     if values.len() >= PARALLEL_ELEMENTS {

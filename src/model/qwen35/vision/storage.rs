@@ -40,7 +40,14 @@ pub(super) trait Element: Copy + Default {
     fn prepare_rotary(heads: usize, dim: usize, positions: &[[usize; 2]]) -> Result<Self::Rotary>;
     fn rotary(rotary: &Self::Rotary, pool: &ThreadPool, values: &mut [Self]) -> Result<()>;
     fn add(pool: &ThreadPool, hidden: &mut [Self], projected: &[Self]) -> Result<()>;
-    fn gelu(pool: &ThreadPool, values: &mut [Self], approximate: bool);
+    fn linear_gelu(
+        layer: &FloatLinear,
+        pool: &ThreadPool,
+        input: &[Self],
+        output: &mut [Self],
+        rows: usize,
+    ) -> Result<()>;
+    fn merger_gelu(pool: &ThreadPool, values: &mut [Self]);
     fn trace(trace: &Trace, layer: i32, name: &str, values: &[Self]) -> Result<()>;
 }
 
@@ -92,8 +99,17 @@ impl Element for u16 {
     fn add(pool: &ThreadPool, hidden: &mut [Self], projected: &[Self]) -> Result<()> {
         vision_half::add(pool, hidden, projected)
     }
-    fn gelu(pool: &ThreadPool, values: &mut [Self], approximate: bool) {
-        vision_half::gelu(pool, values, approximate);
+    fn linear_gelu(
+        layer: &FloatLinear,
+        pool: &ThreadPool,
+        input: &[Self],
+        output: &mut [Self],
+        rows: usize,
+    ) -> Result<()> {
+        layer.run_half_gelu(pool, input, output, rows)
+    }
+    fn merger_gelu(pool: &ThreadPool, values: &mut [Self]) {
+        vision_half::gelu(pool, values);
     }
     fn trace(trace: &Trace, layer: i32, name: &str, values: &[Self]) -> Result<()> {
         trace.save_half(0, layer, name, values)
@@ -164,8 +180,17 @@ impl Element for f32 {
         }
         Ok(())
     }
-    fn gelu(pool: &ThreadPool, values: &mut [Self], approximate: bool) {
-        gelu::apply(pool, values, approximate);
+    fn linear_gelu(
+        layer: &FloatLinear,
+        pool: &ThreadPool,
+        input: &[Self],
+        output: &mut [Self],
+        rows: usize,
+    ) -> Result<()> {
+        layer.run_gelu(pool, input, output, rows)
+    }
+    fn merger_gelu(pool: &ThreadPool, values: &mut [Self]) {
+        gelu::apply(pool, values);
     }
     fn trace(trace: &Trace, layer: i32, name: &str, values: &[Self]) -> Result<()> {
         trace.save(0, layer, name, values)

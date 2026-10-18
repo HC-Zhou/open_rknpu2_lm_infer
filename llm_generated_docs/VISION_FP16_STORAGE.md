@@ -4,7 +4,7 @@
 
 ## 运行参数
 
-默认使用FP16中间张量。需要数值对照时，通过模型参数切换整个ViT的中间张量和CPU计算精度：
+默认使用FP16中间张量，FFN已改为NPU GEMM/bias/GELU融合，旧CPU近似GELU已删除。[融合实现与最新验证](NPU_FFN_GELU_RESEARCH.md)。下文性能表与精度消融为融合前冻结数据。需要数值对照时，通过模型参数切换ViT的中间张量存储精度：
 
 ```sh
 open_rknpu2_lm_infer -m MODEL run --image IMAGE --vision-dtype fp32 -p 'Describe the image.'
@@ -13,18 +13,18 @@ open_rknpu2_lm_infer -m MODEL run --image IMAGE --vision-dtype fp32 -p 'Describe
 
 `--vision-dtype`同样适用于`chat`、`serve`、`vision_probe`与`vision_profile`；服务在启动时选择，实例加载后固定。Rust调用方使用`ModelOptions::vision_dtype`，可选`VisionDtype::Fp16`（默认）或`VisionDtype::Fp32`。没有对应环境变量。
 
-FP32模式恢复旧图的FP32层间张量、bias相加、LayerNorm、GELU、RoPE和残差计算，NPU GEMM、Attention的QK/PV仍使用FP16；它不是下文独立PyTorch全FP32参考。两种模式共用同一执行流程，分别使用HOST_STORAGE和HOST_F32的profile/常驻权重。缓存未命中时采用合法fallback，不在线调优；显式调优FP32 host profile时不带`float_tune --fp16-storage`。
+FP32模式使用FP32层间张量、LayerNorm、RoPE和残差计算；FFN仍使用融合GEMM/bias/GELU，并直接收集为FP32。普通Linear的bias相加和merger erf GELU使用FP32，NPU GEMM、Attention的QK/PV仍使用FP16；它不是下文独立PyTorch全FP32参考，也不复现已删除的CPU FFN。两种模式共用同一执行流程，分别使用HOST_STORAGE和HOST_F32的profile/常驻权重。缓存未命中时采用合法fallback，不在线调优；显式调优FP32 host profile时不带`float_tune --fp16-storage`。
 
-此参数与`RK_NPU_MM_K_TILING`独立：两种张量模式下默认都允许FP16 partial＋NPU FP16 Add tree；需要完整K对照时仍可设置`RK_NPU_MM_K_TILING=off`。`vision_dtype`会写入运行统计和probe/profile报告。
+此参数与`RK_NPU_MM_K_TILING`独立：两种张量模式的普通Linear默认都允许FP16 partial＋NPU FP16 Add tree；融合FFN UP固定完整K，非线性不能作用于未归约的partial；需要完整K对照时仍可设置`RK_NPU_MM_K_TILING=off`。`vision_dtype`会写入运行统计和probe/profile报告。
 
-参数切换已完成板端验证：三种尺寸的默认FP16、手动FP32输出分别与各自冻结参考逐位一致；显式FP16和两种dtype的完整K对照也一致。两种host profile均21 hits、0 miss、0 search。记录见[参数验证](evidence/vision_dtype_20261018/README.md)。
+融合前参数切换的冻结验证：三种尺寸的默认FP16、手动FP32输出分别与各自冻结参考逐位一致；显式FP16和两种dtype的完整K对照也一致。两种host profile均21 hits、0 miss、0 search。记录见[参数验证](evidence/vision_dtype_20261018/README.md)。
 
 ## 已实现
 
 - ViT 的 hidden、normalized、QKV/Q/K/V、Attention结果、MLP和merger中间结果统一为紧凑FP16位模式。
 - `FloatBackend::fp16_storage` / `FloatLinear::run_half` 使用公共MM的HOST_STORAGE；库支持FP32 bias在相加后舍入回FP16，不创建整块FP32输出。
 - `rk_npu_attention_f16_run_half` 复用同一Attention执行器与FP32 CPU归约，直接写FP16结果。
-- CPU LayerNorm的均值/方差使用FP32；GELU使用逐向量临时值计算后写回FP16；残差直接使用FP16加法；位置和RoPE写回FP16。
+- CPU LayerNorm的均值/方差使用FP32；FFN GELU融合到NPU GEMM与bias，Rust直接收集FP16；merger erf GELU在Rust中计算。残差、位置和RoPE写回FP16。
 - 图片patches在入口转换一次；最终features为兼容语言模型的embedding接口扩为FP32一次。开启trace时另为诊断导出FP32，不影响普通执行。
 - RoPE按图片预计算FP32 sin/cos表，跨head和24层复用；CPU NEON转换/旋转后写回FP16。与首版标量FP16 RoPE的三档features和10行logits均逐位一致。
 - 已按要求删除正常MM执行中的逐元素Inf/NaN扫描。显式调优仍在计时外用独立oracle验证输出。
