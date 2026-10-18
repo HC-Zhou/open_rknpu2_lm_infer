@@ -1,6 +1,13 @@
 use super::ConvState;
 
-pub(super) fn row(conv: &ConvState, input: &[f32], weights: &[f32], t: usize, output: &mut [f32]) {
+pub(super) fn row(
+    conv: &ConvState,
+    input: &[f32],
+    stride: usize,
+    weights: &[f32],
+    t: usize,
+    output: &mut [f32],
+) {
     let mut c = 0;
     #[cfg(target_arch = "aarch64")]
     if conv.kernel == 4 {
@@ -21,7 +28,7 @@ pub(super) fn row(conv: &ConvState, input: &[f32], weights: &[f32], t: usize, ou
                         let h = history.unwrap();
                         [h.0, h.1, h.2][t + k]
                     } else {
-                        vld1q_f32(input.as_ptr().add((t + k - 3) * conv.channels + c))
+                        vld1q_f32(input.as_ptr().add((t + k - 3) * stride + c))
                     };
                     value = vfmaq_f32(value, x, w);
                 }
@@ -36,7 +43,7 @@ pub(super) fn row(conv: &ConvState, input: &[f32], weights: &[f32], t: usize, ou
             let x = if t + k < conv.kernel - 1 {
                 conv.history[c * (conv.kernel - 1) + t + k]
             } else {
-                input[(t + k - (conv.kernel - 1)) * conv.channels + c]
+                input[(t + k - (conv.kernel - 1)) * stride + c]
             };
             value += x * weights[c * conv.kernel + k];
         }

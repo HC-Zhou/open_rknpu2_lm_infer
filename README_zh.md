@@ -75,6 +75,8 @@
 
 实验性 `qwen3_5` / `qwen3_5_text` 后端已接入混合文本主干和 PPL 评分。checkpoint 与验证范围见 [C7 上板报告](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md)；MTP 和多模态执行尚待实现。
 
+Qwen3.5 GDN 在 Hk16/Hv32、Dk128/Dv128、K4 形状上，对实际行数大于 12 的 prefill 窗口使用 NPU；更短窗口和 decode 使用 CPU。NPU 乘法使用 ordinary TF32，canonical state 保持 FP32，可直接接续 CPU decode。路由、精度与包括短窗口性能取舍在内的实测见 [NPU GDN prefill](llm_generated_docs/QWEN35_NPU_GDN_PREFILL.md)。
+
 ## 快速开始
 
 在 RK3588 Linux 板上复制粘贴以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。

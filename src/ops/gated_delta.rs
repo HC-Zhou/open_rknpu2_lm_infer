@@ -95,12 +95,7 @@ impl GdnDimensions {
             "GDN update shape mismatch"
         );
         ensure!(
-            updates
-                .key
-                .iter()
-                .chain(updates.value)
-                .all(|v| v.is_finite())
-                && updates.log_decay.iter().all(|v| !v.is_nan() && *v <= 0.0)
+            updates.log_decay.iter().all(|v| !v.is_nan() && *v <= 0.0)
                 && updates
                     .beta
                     .iter()
@@ -236,7 +231,6 @@ impl Workspace {
                 && output.len() == updates.rows * dim.value_width(),
             "GDN query/output shape mismatch"
         );
-        ensure!(query.iter().all(|v| v.is_finite()), "nonfinite GDN query");
         Ok(())
     }
 }

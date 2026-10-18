@@ -26,7 +26,7 @@ impl Qwen35 {
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "gdn_state_bytes":state_bytes,"gdn_convolution_bytes":conv_bytes,"gdn_update_log_bytes":log_bytes,
             "cpu_scratch_bytes":self.work.allocated_bytes()+self.logits.capacity()*4,"attention_cache_payload_bytes":kv_bytes,
-            "mapped_weight_bytes":self.loader.store.mapped_bytes(),"gdn_backend":"cpu-fp32-cpp-neon",
+            "mapped_weight_bytes":self.loader.store.mapped_bytes(),
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
             "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
             "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":false,
@@ -46,6 +46,14 @@ impl Qwen35 {
         result.as_object_mut().unwrap().extend(
             serde_json::to_value(&self.phases)
                 .expect("finite stage totals")
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        result.as_object_mut().unwrap().extend(
+            self.work
+                .recurrent
+                .backend_stats()
                 .as_object()
                 .unwrap()
                 .clone(),

@@ -75,6 +75,8 @@ The engine supports models in the compressed-tensors format with W4A8 or W8A8 li
 
 An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. Qwen3.5 checkpoints with BF16 vision weights also support static images, multiple images and image history through the CLI, terminal chat and OpenAI chat API. See the [C7 text validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) and [vision usage and validation](llm_generated_docs/QWEN35_VISION_PROGRESS.md). MTP generation and video are pending.
 
+Qwen3.5 GDN uses the NPU for actual prefill windows above 12 tokens on supported Hk16/Hv32, Dk128/Dv128, K4 shapes. Smaller windows and decode use the CPU. NPU products use ordinary TF32 with FP32 canonical state shared with CPU decode. See [routing, precision and measurements](llm_generated_docs/QWEN35_NPU_GDN_PREFILL.md), including the short-window performance tradeoff.
+
 ViT uses FP16 intermediate tensors and fused NPU GEMM + bias + approximate GELU in the FFN by default. Set `--vision-dtype fp32` for FP32 intermediate storage in numerical comparisons; FFN fusion and FP16 NPU matmul remain enabled. LayerNorm/softmax reductions accumulate in FP32; the merger retains its exact erf GELU. See [fusion measurements and precision](llm_generated_docs/NPU_FFN_GELU_RESEARCH.md). The option applies to `run`, `chat`, `serve`, and the vision diagnostics in `tests/tools/`.
 
 ## Quick Start

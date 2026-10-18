@@ -22,6 +22,8 @@ mod ffi {
 use ffi::*;
 mod attention;
 pub use attention::Attention;
+mod gated_delta;
+pub use gated_delta::GatedDelta;
 mod floating;
 pub use floating::{FloatBackend, FloatLinear};
 mod policy;

@@ -72,13 +72,7 @@ impl MixerFixture {
         .unwrap()
     }
     pub fn input(&self) -> Projected<'_> {
-        Projected {
-            rows: self.rows,
-            qkv: &self.qkv,
-            z: &self.z,
-            a: &self.a,
-            b: &self.b,
-        }
+        Projected::new(self.rows, &self.qkv, &self.z, &self.a, &self.b)
     }
 }
 
@@ -159,12 +153,12 @@ impl Inputs {
     }
     pub fn view(&self, start: usize, rows: usize) -> Projected<'_> {
         let range = |width| start * width..(start + rows) * width;
-        Projected {
+        Projected::new(
             rows,
-            qkv: &self.qkv[range(self.dim.conv_width())],
-            z: &self.z[range(self.dim.value_width())],
-            a: &self.a[range(self.dim.value_heads())],
-            b: &self.b[range(self.dim.value_heads())],
-        }
+            &self.qkv[range(self.dim.conv_width())],
+            &self.z[range(self.dim.value_width())],
+            &self.a[range(self.dim.value_heads())],
+            &self.b[range(self.dim.value_heads())],
+        )
     }
 }

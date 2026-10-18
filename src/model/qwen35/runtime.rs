@@ -227,6 +227,7 @@ impl LanguageModel for Qwen35 {
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
         self.phases = Timings::default();
+        self.work.recurrent.reset_statistics();
         Ok(())
     }
     fn reserve(&mut self, tokens: usize) -> Result<()> {
@@ -275,6 +276,7 @@ impl LanguageModel for Qwen35 {
                 backend.prepare(*rows)?;
             }
         }
+        self.work.recurrent.prepare(&rows)?;
         self.loader.store.release_pages()?;
         Ok(())
     }

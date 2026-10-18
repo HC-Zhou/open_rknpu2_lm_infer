@@ -7,6 +7,7 @@ use crate::{
     ops::{activation, norm},
 };
 use anyhow::Result;
+use std::time::Instant;
 
 impl Mixer {
     pub fn forward(
@@ -38,29 +39,30 @@ impl Mixer {
                         &mut w.scatter,
                     )
                 })?;
-                timings.measure(Phase::Gdn, || -> Result<()> {
-                    for (t, row) in w.mixed[..rows * width].chunks(width).enumerate() {
-                        w.qkv[t * cw..(t + 1) * cw].copy_from_slice(&row[..cw]);
-                        w.z[t * vw..(t + 1) * vw].copy_from_slice(&row[cw..cw + vw]);
-                        w.a[t * hv..(t + 1) * hv].copy_from_slice(&row[cw + vw..cw + vw + hv]);
-                        w.b[t * hv..(t + 1) * hv].copy_from_slice(&row[cw + vw + hv..]);
-                    }
-                    trace.save(position, index, "gdn_qkv", &w.qkv[..rows * cw])?;
-                    let output = state.forward(
-                        &cpu.pool,
-                        weights,
-                        Projected {
-                            rows,
-                            qkv: &w.qkv[..rows * cw],
-                            z: &w.z[..rows * vw],
-                            a: &w.a[..rows * hv],
-                            b: &w.b[..rows * hv],
-                        },
-                        &mut w.recurrent,
-                    )?;
-                    w.attended[..rows * vw].copy_from_slice(output);
-                    Ok(())
-                })?;
+                let (split_ms, copy_ms) =
+                    timings.measure(Phase::Gdn, || -> Result<(f64, f64)> {
+                        let split_ms = if trace.enabled() {
+                            let start = Instant::now();
+                            let mut qkv = Vec::with_capacity(rows * cw);
+                            for row in w.mixed[..rows * width].chunks(width) {
+                                qkv.extend_from_slice(&row[..cw]);
+                            }
+                            let split_ms = start.elapsed().as_secs_f64() * 1000.;
+                            trace.save(position, index, "gdn_qkv", &qkv)?;
+                            split_ms
+                        } else {
+                            0.
+                        };
+                        state.forward_into(
+                            &cpu.pool,
+                            weights,
+                            Projected::from_merged(c.gdn, rows, &w.mixed[..rows * width])?,
+                            &mut w.recurrent,
+                            &mut w.attended[..rows * vw],
+                        )?;
+                        Ok((split_ms, 0.))
+                    })?;
+                timings.record_gdn_io(split_ms, copy_ms);
                 vw
             }
             Mixer::Attention {

@@ -223,13 +223,7 @@ fn scratch_reuse_cannot_overwrite_other_layer_log_and_abort_keeps_canonical_hist
         8 * (dim.key_width() + dim.value_width() + 2 * dim.value_heads() + dim.conv_width()) * 4
     );
     let before = a.canonical().to_vec();
-    let bad = Projected {
-        rows: 1,
-        qkv: &[],
-        z: &[],
-        a: &[],
-        b: &[],
-    };
+    let bad = Projected::new(1, &[], &[], &[], &[]);
     assert!(a.verify(&pool, &w1, bad, &mut scratch).is_err());
     assert_eq!(a.canonical(), before);
     assert_eq!(a.pending_rows(), None);
@@ -247,4 +241,58 @@ fn scratch_reuse_cannot_overwrite_other_layer_log_and_abort_keeps_canonical_hist
         .forward(&pool, &w1, input.view(0, 7), &mut scratch)
         .unwrap();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn merged_projection_and_caller_output_match_contiguous_state_and_replay() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for (kh, vh, kd, vd, kernel) in [(2, 4, 128, 8, 4), (1, 2, 7, 5, 3)] {
+        let dim = GdnDimensions::new(kh, vh, kd, vd).unwrap();
+        let weight = weights(dim, kernel, 11);
+        let mut a = LayerState::new(dim, kernel, 8).unwrap();
+        let mut b = LayerState::new(dim, kernel, 8).unwrap();
+        let mut sa = Scratch::default();
+        let mut sb = Scratch::default();
+        for rows in [1, 2, 3, 7, 13, 32, 128] {
+            let input = Inputs::new(dim, rows, rows + 19);
+            let mut merged = Vec::new();
+            for t in 0..rows {
+                merged.extend_from_slice(
+                    &input.qkv[t * dim.conv_width()..(t + 1) * dim.conv_width()],
+                );
+                merged.extend_from_slice(
+                    &input.z[t * dim.value_width()..(t + 1) * dim.value_width()],
+                );
+                merged.extend_from_slice(&input.a[t * vh..(t + 1) * vh]);
+                merged.extend_from_slice(&input.b[t * vh..(t + 1) * vh]);
+            }
+            let view = Projected::from_merged(dim, rows, &merged).unwrap();
+            let expected = a
+                .forward(&pool, &weight, input.view(0, rows), &mut sa)
+                .unwrap()
+                .to_vec();
+            let mut actual = vec![0.; expected.len()];
+            b.forward_into(&pool, &weight, view, &mut sb, &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(a.canonical(), b.canonical());
+            assert_eq!(a.convolution(), b.convolution());
+            assert_eq!(a.position(), b.position());
+            if rows <= 7 {
+                let expected = a
+                    .verify(&pool, &weight, input.view(0, rows), &mut sa)
+                    .unwrap()
+                    .to_vec();
+                let actual = b.verify(&pool, &weight, view, &mut sb).unwrap();
+                assert_eq!(actual, expected);
+                a.finish_round(&pool, rows).unwrap();
+                b.finish_round(&pool, rows).unwrap();
+                assert_eq!(a.canonical(), b.canonical());
+                assert_eq!(a.convolution(), b.convolution());
+            }
+        }
+    }
 }

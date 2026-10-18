@@ -3,6 +3,7 @@
 use anyhow::{Result, ensure};
 use rayon::ThreadPool;
 use serde::Serialize;
+use std::time::Instant;
 
 use super::mixer::{MixerWeights, MixerWorkspace, Projected, ValidatedProjected};
 use crate::ops::{
@@ -33,7 +34,10 @@ impl UpdateLog {
         self.log_decay.clone_from(&mixer.log_decay);
         self.beta.clone_from(&mixer.beta);
         self.conv_input.clear();
-        self.conv_input.extend_from_slice(input.qkv);
+        let width = mixer.key.len() / input.rows * 2 + mixer.value.len() / input.rows;
+        for row in input.qkv.chunks(input.row_stride(width)) {
+            self.conv_input.extend_from_slice(&row[..width]);
+        }
     }
     fn updates(&self, rows: usize) -> Updates<'_> {
         Updates {
@@ -63,9 +67,55 @@ pub struct Scratch {
     state: Vec<f32>,
     conv: Option<ConvState>,
     mixer: MixerWorkspace,
+    prefill: Option<crate::npu::GatedDelta>,
+    cpu_calls: usize,
+    cpu_tokens: usize,
+    prepare_ms: f64,
 }
 
 impl Scratch {
+    pub fn with_npu(backend: crate::npu::Backend) -> Self {
+        Self {
+            prefill: Some(crate::npu::GatedDelta::new(backend)),
+            ..Self::default()
+        }
+    }
+    pub fn prepare(&mut self, rows: &[usize]) -> Result<()> {
+        if let Some(prefill) = &mut self.prefill {
+            prefill.retain_workspaces(rows);
+            for &m in rows {
+                prefill.prepare(m)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn reset_statistics(&mut self) {
+        self.cpu_calls = 0;
+        self.cpu_tokens = 0;
+        self.prepare_ms = 0.;
+        self.mixer.buffers_ms = 0.;
+        self.mixer.gates_ms = 0.;
+        self.mixer.output_norm_ms = 0.;
+        if let Some(prefill) = &mut self.prefill {
+            prefill.reset_statistics();
+        }
+    }
+    pub fn backend_stats(&self) -> serde_json::Value {
+        let mut stats = serde_json::json!({
+            "gdn_backend":if self.prefill.is_some() { "npu-tf32-prefill/cpu-fp32-decode" } else { "cpu-fp32-cpp-neon" },
+            "gdn_cpu_max_rows":crate::npu::GatedDelta::CPU_MAX_ROWS,"gdn_cpu_calls":self.cpu_calls,"gdn_cpu_tokens":self.cpu_tokens,
+            "gdn_layer_prepare_ms":self.prepare_ms,"gdn_buffers_ms":self.mixer.buffers_ms,
+            "gdn_gates_ms":self.mixer.gates_ms,"gdn_output_norm_ms":self.mixer.output_norm_ms,
+        });
+        if let Some(prefill) = &self.prefill {
+            stats
+                .as_object_mut()
+                .unwrap()
+                .extend(prefill.stats().as_object().unwrap().clone());
+        }
+        stats
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         self.state.capacity() * 4
             + self.conv.as_ref().map_or(0, ConvState::allocated_bytes)
@@ -172,6 +222,8 @@ impl LayerState {
             Some(&self.state),
             &mut scratch.state,
             scratch.conv.as_mut().unwrap(),
+            None,
+            None,
         )?;
         Ok(scratch.mixer.output())
     }
@@ -185,11 +237,42 @@ impl LayerState {
         input: Projected<'_>,
         scratch: &'a mut Scratch,
     ) -> Result<&'a [f32]> {
+        self.forward_impl(pool, weights, input, scratch, None)?;
+        Ok(scratch.mixer.output())
+    }
+
+    /// Write the gated, normalized recurrence output into the caller's buffer.
+    pub fn forward_into(
+        &mut self,
+        pool: &ThreadPool,
+        weights: &MixerWeights,
+        input: Projected<'_>,
+        scratch: &mut Scratch,
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.forward_impl(pool, weights, input, scratch, Some(output))
+    }
+
+    fn forward_impl(
+        &mut self,
+        pool: &ThreadPool,
+        weights: &MixerWeights,
+        input: Projected<'_>,
+        scratch: &mut Scratch,
+        output: Option<&mut [f32]>,
+    ) -> Result<()> {
         ensure!(
             self.pending.is_none(),
             "GDN verification transaction is active"
         );
+        let start = Instant::now();
         let checked = self.prepare(weights, input, scratch)?;
+        scratch.prepare_ms += start.elapsed().as_secs_f64() * 1000.;
+        let npu = scratch.prefill.as_mut().filter(|_| {
+            input.rows > crate::npu::GatedDelta::CPU_MAX_ROWS
+                && crate::npu::GatedDelta::supports(self.dim, self.kernel)
+        });
+        let used_npu = npu.is_some();
         scratch.mixer.run(
             pool,
             weights,
@@ -197,10 +280,16 @@ impl LayerState {
             None,
             &mut self.state,
             scratch.conv.as_mut().unwrap(),
+            npu,
+            output,
         )?;
+        if !used_npu {
+            scratch.cpu_calls += 1;
+            scratch.cpu_tokens += input.rows;
+        }
         std::mem::swap(&mut self.conv, scratch.conv.as_mut().unwrap());
         self.position += input.rows;
-        Ok(scratch.mixer.output())
+        Ok(())
     }
 
     /// Speculative validation leaves canonical state/history byte-for-byte intact.
@@ -257,3 +346,7 @@ impl LayerState {
 }
 
 use anyhow::Context;
+
+#[cfg(test)]
+#[path = "npu_tests.rs"]
+mod npu_tests;

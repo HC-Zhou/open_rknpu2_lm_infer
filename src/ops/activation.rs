@@ -56,6 +56,34 @@ pub fn silu_in_place(values: &mut [f32]) {
     }
 }
 
+/// SiLU(z) times the weighted, normalized row, without an intermediate gate.
+pub(super) fn silu_norm(input: &[f32], z: &[f32], weight: &[f32], scale: f32, output: &mut [f32]) {
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        while i + 4 <= input.len() {
+            let gate = vld1q_f32(z.as_ptr().add(i));
+            if vminvq_u32(vcleq_f32(vabsq_f32(gate), vdupq_n_f32(80.0))) == u32::MAX {
+                let gate = vdivq_f32(gate, vaddq_f32(vdupq_n_f32(1.0), exp(vnegq_f32(gate))));
+                let value = vmulq_f32(
+                    vmulq_n_f32(vld1q_f32(input.as_ptr().add(i)), scale),
+                    vld1q_f32(weight.as_ptr().add(i)),
+                );
+                vst1q_f32(output.as_mut_ptr().add(i), vmulq_f32(gate, value));
+            } else {
+                for j in i..i + 4 {
+                    output[j] = silu(z[j]) * ((input[j] * scale) * weight[j]);
+                }
+            }
+            i += 4;
+        }
+    }
+    for j in i..input.len() {
+        output[j] = silu(z[j]) * ((input[j] * scale) * weight[j]);
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn exp(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;

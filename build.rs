@@ -52,6 +52,7 @@ fn main() {
         .header(include.join("rk_npu_attention_f16.h").to_string_lossy())
         .header(include.join("rk_npu_mm_tune.h").to_string_lossy())
         .header(include.join("rk_npu_mm_gelu.h").to_string_lossy())
+        .header(include.join("rk_npu_gdn.h").to_string_lossy())
         .clang_arg(format!("-I{}", include.display()))
         .allowlist_function("rk_npu_.*")
         .allowlist_type("rk_npu_.*")

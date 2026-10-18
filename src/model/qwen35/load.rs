@@ -229,7 +229,11 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         &embedding,
         config.tie_word_embeddings,
     )?;
-    let work = Buffers::new(&config, options.chunk);
+    let mut work = Buffers::new(&config, options.chunk);
+    if crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
+        work.recurrent =
+            crate::layers::gated_delta::Scratch::with_npu(backends.last().unwrap().clone());
+    }
     let info = ModelInfo {
         id: options
             .path

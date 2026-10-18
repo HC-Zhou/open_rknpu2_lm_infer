@@ -27,13 +27,7 @@ pub fn bench(pool: &ThreadPool, rows: usize, layers: usize) -> Result<Value> {
     let z = series(rows * dim.value_width(), 1.0);
     let a = series(rows * 32, 0.3);
     let b = series(rows * 32, 0.5);
-    let input = Projected {
-        rows,
-        qkv: &qkv,
-        z: &z,
-        a: &a,
-        b: &b,
-    };
+    let input = Projected::new(rows, &qkv, &z, &a, &b);
     let mut bank = (0..layers)
         .map(|_| LayerState::new(dim, 4, 8))
         .collect::<Result<Vec<_>>>()?;

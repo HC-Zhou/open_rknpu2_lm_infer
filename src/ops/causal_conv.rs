@@ -28,6 +28,9 @@ impl ConvState {
     pub fn history(&self) -> &[f32] {
         &self.history
     }
+    pub(crate) fn history_mut(&mut self) -> &mut [f32] {
+        &mut self.history
+    }
     pub fn reset(&mut self) {
         self.history.fill(0.0);
     }
@@ -68,9 +71,27 @@ impl ConvState {
         weights: &[f32],
         output: &mut [f32],
     ) -> Result<()> {
+        self.run_parallel_strided(pool, input, self.channels, weights, output)
+    }
+
+    pub(crate) fn run_parallel_strided(
+        &mut self,
+        pool: &ThreadPool,
+        input: &[f32],
+        stride: usize,
+        weights: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        let rows = output.len() / self.channels;
         ensure!(
-            input.len().is_multiple_of(self.channels)
-                && input.len() == output.len()
+            output.len().is_multiple_of(self.channels)
+                && stride >= self.channels
+                && (rows == 0 && input.is_empty()
+                    || rows
+                        .checked_sub(1)
+                        .and_then(|n| n.checked_mul(stride))
+                        .and_then(|n| n.checked_add(self.channels))
+                        == Some(input.len()))
                 && self.channels.checked_mul(self.kernel) == Some(weights.len()),
             "convolution shape mismatch"
         );
@@ -78,9 +99,10 @@ impl ConvState {
             output
                 .par_chunks_mut(self.channels)
                 .enumerate()
-                .for_each(|(t, out)| kernel::row(self, input, weights, t, out));
+                .for_each(|(t, out)| kernel::row(self, input, stride, weights, t, out));
         });
-        self.append(input)
+        self.append_strided(input, stride, rows);
+        Ok(())
     }
 
     fn append_row(&mut self, row: &[f32]) {
@@ -98,17 +120,21 @@ impl ConvState {
             input.len().is_multiple_of(self.channels),
             "convolution replay shape mismatch"
         );
-        if self.kernel == 1 || input.is_empty() {
-            return Ok(());
-        }
         let rows = input.len() / self.channels;
+        self.append_strided(input, self.channels, rows);
+        Ok(())
+    }
+
+    fn append_strided(&mut self, input: &[f32], stride: usize, rows: usize) {
+        if self.kernel == 1 || rows == 0 {
+            return;
+        }
         let keep = rows.min(self.kernel - 1);
         for (c, history) in self.history.chunks_mut(self.kernel - 1).enumerate() {
             history.copy_within(keep.., 0);
             for (j, value) in history[self.kernel - 1 - keep..].iter_mut().enumerate() {
-                *value = input[(rows - keep + j) * self.channels + c];
+                *value = input[(rows - keep + j) * stride + c];
             }
         }
-        Ok(())
     }
 }

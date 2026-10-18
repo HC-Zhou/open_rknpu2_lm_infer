@@ -19,6 +19,18 @@ fn delta(begin: &Value, end: &Value) -> Value {
         "cpu_ms",
         "head_ms",
         "decoder_ms",
+        "gdn_split_ms",
+        "gdn_layer_prepare_ms",
+        "gdn_buffers_ms",
+        "gdn_gates_ms",
+        "gdn_output_norm_ms",
+        "gdn_output_copy_ms",
+        "gdn_npu_ms",
+        "gdn_npu_hardware_ms",
+        "gdn_npu_prepare_ms",
+        "gdn_npu_coefficients_ms",
+        "gdn_npu_solve_ms",
+        "gdn_npu_collect_ms",
     ] {
         if let (Some(a), Some(b)) = (begin[key].as_f64(), end[key].as_f64()) {
             result[key] = json!(b - a);

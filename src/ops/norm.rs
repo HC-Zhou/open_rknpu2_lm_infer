@@ -1,5 +1,5 @@
 //! FP32 normalization with a fixed scalar reduction order.
-use super::activation::{silu, silu_in_place};
+use super::activation::silu_norm;
 use anyhow::{Result, ensure};
 use rayon::{ThreadPool, prelude::*};
 
@@ -47,55 +47,111 @@ pub fn rms_norm(
     Ok(())
 }
 
-pub fn gated_norm(
-    input: &[f32],
-    z: &[f32],
-    weight: &[f32],
-    epsilon: f32,
-    output: &mut [f32],
-) -> Result<()> {
-    ensure!(z.len() == input.len(), "GDN gate shape mismatch");
-    rms_norm(input, weight, epsilon, false, output)?;
-    for (out, z) in output.iter_mut().zip(z) {
-        *out *= silu(*z);
-    }
-    Ok(())
-}
-
-pub fn gated_norm_parallel(
+/// Each token contains token_width values; z can be a view of a wider projection.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_norm_parallel_strided(
     pool: &ThreadPool,
     input: &[f32],
     z: &[f32],
+    z_stride: usize,
+    token_width: usize,
     weight: &[f32],
     epsilon: f32,
     output: &mut [f32],
 ) -> Result<()> {
     ensure!(
         !weight.is_empty()
-            && input.len().is_multiple_of(weight.len())
-            && z.len() == input.len()
+            && token_width > 0
+            && token_width.is_multiple_of(weight.len())
+            && input.len().is_multiple_of(token_width)
+            && z_stride >= token_width
+            && input.len().checked_div(token_width).and_then(|rows| {
+                if rows == 0 {
+                    Some(0)
+                } else {
+                    (rows - 1)
+                        .checked_mul(z_stride)
+                        .and_then(|n| n.checked_add(token_width))
+                }
+            }) == Some(z.len())
             && output.len() == input.len()
             && epsilon.is_finite()
             && epsilon > 0.0,
         "GDN gated norm shape/epsilon mismatch"
     );
     pool.install(|| {
+        let heads = token_width / weight.len();
         input
             .par_chunks(weight.len())
-            .zip(z.par_chunks(weight.len()))
             .zip(output.par_chunks_mut(weight.len()))
-            .for_each(|((x, z), out)| {
+            .enumerate()
+            .for_each(|(row, (x, out))| {
+                let start = (row / heads) * z_stride + (row % heads) * weight.len();
+                let z = &z[start..start + weight.len()];
                 // Preserve the scalar norm's FP32 reduction order. The expensive
                 // gate uses ggml's vector SiLU on AArch64.
                 let scale = (x.iter().map(|v| v * v).sum::<f32>() / weight.len() as f32 + epsilon)
                     .sqrt()
                     .recip();
-                out.copy_from_slice(z);
-                silu_in_place(out);
-                for ((out, x), w) in out.iter_mut().zip(x).zip(weight) {
-                    *out *= (x * scale) * w;
-                }
+                silu_norm(x, z, weight, scale, out);
             });
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fused_strided_gates_preserve_normalization_bits() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for width in [1, 3, 7, 128] {
+            let token_width = width * 3;
+            let stride = token_width + 19;
+            let rows = 9;
+            let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i as f32 * 0.17).sin()).collect();
+            let input: Vec<f32> = (0..rows * token_width)
+                .map(|i| (i as f32 * 0.13).cos())
+                .collect();
+            let z: Vec<f32> = (0..input.len())
+                .map(|i| [-1000., 1000., -81., -80., -0., 0., 0.3, 1., 79., 81.][i % 10])
+                .collect();
+            let mut strided = vec![f32::NAN; (rows - 1) * stride + token_width];
+            for t in 0..rows {
+                strided[t * stride..t * stride + token_width]
+                    .copy_from_slice(&z[t * token_width..(t + 1) * token_width]);
+            }
+            let mut expected = z.clone();
+            for (x, out) in input.chunks(width).zip(expected.chunks_mut(width)) {
+                let scale = (x.iter().map(|v| v * v).sum::<f32>() / width as f32 + 1e-6)
+                    .sqrt()
+                    .recip();
+                crate::ops::activation::silu_in_place(out);
+                for ((out, x), w) in out.iter_mut().zip(x).zip(&weight) {
+                    *out *= (x * scale) * w;
+                }
+            }
+            let mut actual = vec![0.; input.len()];
+            super::gated_norm_parallel_strided(
+                &pool,
+                &input,
+                &strided,
+                stride,
+                token_width,
+                &weight,
+                1e-6,
+                &mut actual,
+            )
+            .unwrap();
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "width={width}"
+            );
+        }
+    }
 }
