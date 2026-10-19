@@ -46,6 +46,8 @@ pub struct Qwen35 {
     pub(super) mtp_available: bool,
     pub(super) vision: Option<super::vision::Encoder>,
     pub(super) next_rope_position: usize,
+    pub(super) round: Option<super::transaction::Round>,
+    pub(super) mtp: Option<super::mtp::Predictor>,
 }
 
 impl Qwen35 {
@@ -70,6 +72,16 @@ impl Qwen35 {
         tokens: &[u32],
         cancelled: Option<&AtomicBool>,
         prepared: Option<EmbeddedChunk<'_>>,
+    ) -> Result<()> {
+        self.chunk_mode(tokens, cancelled, prepared, false)
+    }
+
+    pub(super) fn chunk_mode(
+        &mut self,
+        tokens: &[u32],
+        cancelled: Option<&AtomicBool>,
+        prepared: Option<EmbeddedChunk<'_>>,
+        verify: bool,
     ) -> Result<()> {
         let start = Instant::now();
         let h = self.config.hidden_size;
@@ -104,6 +116,11 @@ impl Qwen35 {
                 .collect();
             &positions
         };
+        let embeddings = self
+            .mtp
+            .as_ref()
+            .filter(|_| !verify)
+            .map(|_| self.work.hidden[..tokens.len() * h].to_vec());
         for (i, layer) in self.layers.iter_mut().enumerate() {
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -119,18 +136,38 @@ impl Qwen35 {
                     index: i as i32,
                     trace: &self.trace,
                     rope_positions,
+                    verify,
                 },
                 &mut self.phases,
             )?;
         }
-        self.position += tokens.len();
-        self.next_rope_position = rope_positions
-            .iter()
-            .flatten()
-            .copied()
-            .max()
-            .unwrap_or(self.next_rope_position)
-            + 1;
+        if let (Some(mtp), Some(embeddings)) = (&mut self.mtp, embeddings) {
+            norm::rms_norm(
+                &self.work.hidden[..tokens.len() * h],
+                &self.final_norm,
+                self.config.epsilon,
+                true,
+                &mut self.work.normalized[..tokens.len() * h],
+            )?;
+            mtp.catch_up(
+                &self.config,
+                &self.cpu,
+                &embeddings,
+                &self.work.normalized[..tokens.len() * h],
+                rope_positions,
+                &self.trace,
+            )?;
+        }
+        if !verify {
+            self.position += tokens.len();
+            self.next_rope_position = rope_positions
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .unwrap_or(self.next_rope_position)
+                + 1;
+        }
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
@@ -142,6 +179,10 @@ impl Qwen35 {
         logits: bool,
     ) -> Result<()> {
         self.check_input(tokens)?;
+        ensure!(
+            self.round.is_none(),
+            "Qwen3.5 verification transaction is active"
+        );
         self.reserve(self.position + tokens.len())?;
         let result = (|| {
             let mut rows = 0;
@@ -167,6 +208,10 @@ impl Qwen35 {
     }
 
     fn score(&mut self, tokens: &[u32], targets: &[u32]) -> Result<Vec<f64>> {
+        ensure!(
+            self.round.is_none(),
+            "Qwen3.5 verification transaction is active"
+        );
         self.check_input(tokens)?;
         ensure!(
             tokens.len() == targets.len()
@@ -223,6 +268,10 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.position = 0;
+        self.round = None;
+        if let Some(mtp) = &mut self.mtp {
+            mtp.reset()?;
+        }
         self.next_rope_position = 0;
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
@@ -309,5 +358,72 @@ impl LanguageModel for Qwen35 {
     }
     fn stats(&self) -> serde_json::Value {
         self.statistics()
+    }
+    fn enable_mtp(&mut self, max_draft: usize) -> Result<()> {
+        let start = Instant::now();
+        ensure!(
+            self.position == 0 && self.round.is_none(),
+            "configure MTP before prefill"
+        );
+        if max_draft == 0 {
+            self.mtp = None;
+            return Ok(());
+        }
+        ensure!(
+            (1..=7).contains(&max_draft) && max_draft < self.options.chunk,
+            "MTP draft length must be 1..7 and smaller than ubatch"
+        );
+        if let Some(mtp) = &mut self.mtp {
+            mtp.max_draft = max_draft;
+            return Ok(());
+        }
+        let domain = 13u32
+            .checked_sub(self.backends.len() as u32)
+            .ok_or_else(|| anyhow::anyhow!("no free IOMMU domain for MTP"))?;
+        self.mtp = Some(super::mtp::Predictor::load(
+            &self.options,
+            &self.config,
+            &self.loader.store,
+            domain,
+            max_draft,
+        )?);
+        self.load_ms += start.elapsed().as_secs_f64() * 1000.;
+        Ok(())
+    }
+    fn speculation_window(&self) -> usize {
+        self.mtp.as_ref().map_or(0, |m| m.max_draft)
+    }
+    fn speculation_p_min(&self) -> f64 {
+        self.options.mtp_p_min
+    }
+    fn speculation_sampling(&self) -> crate::sampling::DraftSampling {
+        self.options.mtp_sampling
+    }
+    fn draft_logits(&mut self, token: u32, cancel: &AtomicBool) -> Result<&[f32]> {
+        ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
+        ensure!(
+            self.round.is_none() && (token as usize) < self.info.vocab_size,
+            "invalid MTP draft token or active target verification"
+        );
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("MTP is disabled"))?;
+        let input = mtp.draft(&self.config, &self.cpu, &self.embedding, token, &self.trace)?;
+        let head_start = Instant::now();
+        self.logits.resize(self.info.vocab_size, 0.);
+        self.head.prepare(1)?;
+        self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
+        self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
+        Ok(&self.logits)
+    }
+    fn verify_tokens(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
+        Qwen35::verify_tokens(self, tokens, cancel)
+    }
+    fn finish_verification(&mut self, consumed: usize) -> Result<()> {
+        Qwen35::finish_verification(self, consumed)
+    }
+    fn abort_verification(&mut self) -> Result<()> {
+        Qwen35::abort_verification(self)
     }
 }

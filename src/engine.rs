@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 mod context;
+#[cfg(test)]
+mod tests;
 use context::{PrefixCache, validate_request_tokens};
 
 #[derive(Debug, Clone)]
@@ -321,41 +323,113 @@ fn run_generation(
     let mut decode_calls = 0;
     let mut decode_model_ms = 0.0;
     let decode_start = Instant::now();
-    for index in 0..job.request.max_tokens {
+    let mut pending = None;
+    let mut draft_ms = 0.;
+    let mut verify_ms = 0.;
+    let mut repair_ms = 0.;
+    let mut proposed = 0;
+    let mut draft_attempts = 0;
+    let mut confidence_stops = 0;
+    let mut accepted = 0;
+    let mut consumed_tokens = 0;
+    let mut accepted_histogram = vec![0usize; model.speculation_window() + 1];
+    let mut spec_rounds = 0;
+    let mut verify_input_rows = 0;
+    let mut verify_physical_rows = 0;
+    let mut replay_rows = 0;
+    let mut repair_rows = 0;
+    while generated < job.request.max_tokens {
         ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
-        let token = sampler.sample(&cache.logits)?;
-        generated += 1;
-        if model.info().eos_tokens.contains(&token) {
-            reason = "stop";
-            break;
-        }
-        sampler.observe(token);
-        if let Some(piece) = decoder
-            .step(token)
-            .map_err(|e| anyhow!("stream decode: {e}"))?
-        {
-            let (output, stopped) = filter.push(&piece);
-            if !output.is_empty() {
-                text.push_str(&output);
-                if ttft_ms.is_none() {
-                    ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-                }
-                send_event(job, GenerationEvent::Token(output))?;
+        let call = Instant::now();
+        let round = if let Some(anchor) = pending.filter(|_| model.speculation_window() > 0) {
+            Some(crate::speculative::run_round(
+                model,
+                &mut sampler,
+                anchor,
+                job.request.max_tokens - generated,
+                &job.cancel,
+            )?)
+        } else {
+            None
+        };
+        let batch = if let Some(round) = &round {
+            draft_ms += round.draft_ms;
+            verify_ms += round.verify_ms;
+            proposed += round.inputs.len() - 1;
+            draft_attempts += round.draft_attempts;
+            confidence_stops += usize::from(round.confidence_stopped);
+            round.output.clone()
+        } else {
+            if let Some(anchor) = pending {
+                cache.logits = model.forward_cancellable(&[anchor], &job.cancel)?.to_vec();
+                cache.append_token(anchor);
+                decode_calls += 1;
+                consumed_tokens += 1;
             }
-            if stopped {
+            vec![sampler.sample(&cache.logits)?]
+        };
+        let mut events = Vec::new();
+        let mut emitted = 0;
+        let mut stopped = false;
+        for &token in &batch {
+            ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
+            generated += 1;
+            emitted += 1;
+            pending = Some(token);
+            if model.info().eos_tokens.contains(&token) {
+                stopped = true;
                 reason = "stop";
                 break;
             }
+            sampler.observe(token);
+            if let Some(piece) = decoder
+                .step(token)
+                .map_err(|e| anyhow!("stream decode: {e}"))?
+            {
+                let (output, stop) = filter.push(&piece);
+                if !output.is_empty() {
+                    events.push(output);
+                }
+                if stop {
+                    stopped = true;
+                    reason = "stop";
+                    break;
+                }
+            }
         }
-        if index + 1 < job.request.max_tokens {
-            let call = Instant::now();
-            cache.logits.clear();
-            cache
-                .logits
-                .extend_from_slice(model.forward_cancellable(&[token], &job.cancel)?);
-            decode_model_ms += call.elapsed().as_secs_f64() * 1000.0;
+        if let Some(round) = round {
+            let repair_start = Instant::now();
+            model.finish_verification(emitted)?;
+            repair_ms += repair_start.elapsed().as_secs_f64() * 1000.;
+            let vocab = model.info().vocab_size;
+            cache.logits = round.logits[(emitted - 1) * vocab..emitted * vocab].to_vec();
+            for &input in &round.inputs[..emitted] {
+                cache.append_token(input);
+            }
+            accepted += round.accepted.min(emitted);
+            accepted_histogram[round.accepted.min(emitted)] += 1;
+            spec_rounds += 1;
+            verify_input_rows += round.inputs.len();
+            verify_physical_rows += round.inputs.len().next_power_of_two();
+            if emitted < round.inputs.len() {
+                replay_rows += emitted;
+            }
+            repair_rows += emitted;
             decode_calls += 1;
-            cache.append_token(token);
+            consumed_tokens += emitted;
+        }
+        if generated > emitted {
+            decode_model_ms += call.elapsed().as_secs_f64() * 1000.;
+        }
+        for output in events {
+            text.push_str(&output);
+            if ttft_ms.is_none() {
+                ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.);
+            }
+            send_event(job, GenerationEvent::Token(output))?;
+        }
+        if stopped {
+            break;
         }
     }
     let tail = filter.finish();
@@ -372,7 +446,15 @@ fn run_generation(
         cached_tokens,
         timings: json!({"queue_ms":queue_ms,"prepare_ms":prepare_ms,"prefill_ms":prefill_ms,
             "ttft_ms":ttft_ms,"decode_ms":decode_ms,"decode_model_ms":decode_model_ms,"decode_calls":decode_calls,
-            "decode_tokens_per_second": if decode_model_ms > 0.0 { Some(decode_calls as f64 * 1000.0 / decode_model_ms) } else { None },
+            "decode_tokens_per_second": if decode_model_ms > 0.0 { Some(consumed_tokens as f64 * 1000.0 / decode_model_ms) } else { None },
+            "mtp_proposed":proposed,"mtp_accepted":accepted,
+            "mtp_draft_attempts":draft_attempts,"mtp_confidence_stops":confidence_stops,
+            "mtp_accepted_per_attempt":if draft_attempts > 0 { Some(accepted as f64 / draft_attempts as f64) } else { None },
+            "accepted_prefix_histogram":accepted_histogram,"spec_rounds":spec_rounds,
+            "verify_input_rows":verify_input_rows,"verify_physical_rows":verify_physical_rows,
+            "target_consumed_tokens":model.position(),"decode_consumed_tokens":consumed_tokens,"emitted_tokens":generated,
+            "replay_rows":replay_rows,"draft_repair_rows":repair_rows,"fallback_reason":null,
+            "mtp_draft_ms":draft_ms,"mtp_verify_ms":verify_ms,"mtp_repair_ms":repair_ms,
             "generation_ms":start.elapsed().as_secs_f64()*1000.0}),
         stats: model.stats(),
     };

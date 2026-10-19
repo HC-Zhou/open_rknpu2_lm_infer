@@ -25,6 +25,7 @@ impl Mixer {
             index,
             trace,
             rope_positions,
+            verify,
         } = *e;
         let h = c.hidden_size;
         let attended_width = match self {
@@ -53,13 +54,23 @@ impl Mixer {
                         } else {
                             0.
                         };
-                        state.forward_into(
-                            &cpu.pool,
-                            weights,
-                            Projected::from_merged(c.gdn, rows, &w.mixed[..rows * width])?,
-                            &mut w.recurrent,
-                            &mut w.attended[..rows * vw],
-                        )?;
+                        let input = Projected::from_merged(c.gdn, rows, &w.mixed[..rows * width])?;
+                        if verify {
+                            w.attended[..rows * vw].copy_from_slice(state.verify(
+                                &cpu.pool,
+                                weights,
+                                input,
+                                &mut w.recurrent,
+                            )?);
+                        } else {
+                            state.forward_into(
+                                &cpu.pool,
+                                weights,
+                                input,
+                                &mut w.recurrent,
+                                &mut w.attended[..rows * vw],
+                            )?;
+                        }
                         Ok((split_ms, 0.))
                     })?;
                 timings.record_gdn_io(split_ms, copy_ms);
@@ -136,6 +147,9 @@ impl Mixer {
                         position,
                     )
                 })?;
+                if verify && rows > 1 {
+                    timings.record_attention_verification(rows);
+                }
                 timings.measure(Phase::Cpu, || {
                     activation::sigmoid_gate(&mut w.attended[..rows * q], &w.gate[..rows * q])
                 })?;

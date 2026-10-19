@@ -209,9 +209,9 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             input_norm: vector(&loader, &format!("{p}.input_layernorm.weight"), h)?,
             post_norm: vector(&loader, &format!("{p}.post_attention_layernorm.weight"), h)?,
             inputs: Projection::load(backend, &loader, &cpu, inputs, h)?,
-            output: linear(backend, &loader, &cpu, out, h, out_k)?,
+            output: linear(backend, &loader, &cpu, out, h, out_k)?.into(),
             gate_up: Projection::load(backend, &loader, &cpu, gu, h)?,
-            down: linear(backend, &loader, &cpu, down, h, f)?,
+            down: linear(backend, &loader, &cpu, down, h, f)?.into(),
             mixer,
         });
         reserved_kv += kv;
@@ -277,5 +277,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         mtp_available,
         vision: None,
         next_rope_position: 0,
+        round: None,
+        mtp: None,
     })
 }

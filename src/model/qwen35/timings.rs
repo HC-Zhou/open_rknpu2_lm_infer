@@ -10,6 +10,8 @@ pub(super) struct Timings {
     cpu_ms: f64,
     gdn_split_ms: f64,
     gdn_output_copy_ms: f64,
+    attention_verify_calls: usize,
+    attention_verify_rows: usize,
 }
 
 pub(super) enum Phase {
@@ -20,6 +22,10 @@ pub(super) enum Phase {
 }
 
 impl Timings {
+    pub fn record_attention_verification(&mut self, rows: usize) {
+        self.attention_verify_calls += 1;
+        self.attention_verify_rows += rows;
+    }
     pub fn record_gdn_io(&mut self, split_ms: f64, output_copy_ms: f64) {
         self.gdn_split_ms += split_ms;
         self.gdn_output_copy_ms += output_copy_ms;

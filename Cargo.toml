@@ -40,6 +40,11 @@ path = "tests/tools/qwen35_inventory.rs"
 test = false
 
 [[example]]
+name = "mtp_bench"
+path = "tests/tools/mtp_bench.rs"
+test = false
+
+[[example]]
 name = "vision_probe"
 path = "tests/tools/vision_probe.rs"
 test = false

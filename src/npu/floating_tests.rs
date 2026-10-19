@@ -17,6 +17,9 @@ fn floating_profiles_preserve_weights_and_reload_without_search() -> Result<()> 
         tune_cache: cache.path().into(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     };
     configure_cpu(&mut options)?;
     for dtype in [RK_NPU_MM_F16, RK_NPU_MM_BF16] {
@@ -95,6 +98,9 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
             tune_cache: Default::default(),
             attention_tile: 512,
             vision_dtype: Default::default(),
+            mtp_draft: 0,
+            mtp_p_min: 0.,
+            mtp_sampling: Default::default(),
         };
         configure_cpu(&mut options)?;
         let device = Backend::new(&options, 12)?;

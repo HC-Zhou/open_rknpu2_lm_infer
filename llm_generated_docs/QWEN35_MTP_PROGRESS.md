@@ -1,5 +1,7 @@
 # Qwen3.5 / MTP 实现进度
 
+2026-10-19 MTP 主线更新：已接入真实 C7 坐标适配、MTP 网络、prompt prefill/修复、整模型验证事务和公共生成 engine。独立 FP32 MTP 层与八个 target 接受边界通过；固定 K3 四提示三轮 ABBA 为 9.200→11.811 tok/s，约1.284×，默认关闭。命令及起草行为对齐 llama.cpp 的 `--spec-type draft-mtp`、`--spec-draft-n-max`、`--spec-draft-p-min`、`--spec-draft-sampling`。后续CPU softmax跨1024问题确认为FP16归一化顺序切换，现由native按AR数值模式分段，已删除专用资格接口和模型层fallback。当前状态和证据见 [QWEN35_MTP_RUNTIME.md](QWEN35_MTP_RUNTIME.md)，batch Attention 的根因及集成回归见 [QWEN35_BATCH_ATTENTION_PRECISION_AUDIT.md](QWEN35_BATCH_ATTENTION_PRECISION_AUDIT.md)。以下为文本主干阶段的历史记录。
+
 日期：2026-10-17，Asia/Shanghai（UTC+08:00）。
 
 已完成本阶段的 Qwen3.5 混合文本 AR 主干、CPU GDN 优化和备用1验证。最新 C++ GDN / 批量 Attention 版本在固定前 32 个 WikiText 窗口、8,160 个评分 token 上的 PPL 为 **8.578578**；同权重 FP32 参考为 **8.601783**，相对差异 **−0.269768%**。首轮 `ubatch=32/128` 的 PPL 均为 8.594177，历史结果单独保留。详细交接、范围和复现命令见 [QWEN35_C7_BOARD_VALIDATION.md](QWEN35_C7_BOARD_VALIDATION.md)。本阶段完成不代表整个 MTP 实现计划完成。

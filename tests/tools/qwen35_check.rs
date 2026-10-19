@@ -109,6 +109,9 @@ fn main() -> Result<()> {
         tune_cache: args.report.with_extension("cache"),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     })?;
     let mut checks = Vec::new();
     let mut passed = true;

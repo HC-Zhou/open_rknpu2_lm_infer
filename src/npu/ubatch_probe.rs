@@ -55,6 +55,9 @@ fn real_weight_ubatch_probe() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     };
     configure_cpu(&mut options)?;
     let ctx = Handle::new(unsafe { rk_npu_open(ptr::null()) }, rk_npu_close, "NPU")?;
@@ -262,6 +265,9 @@ fn large_ubatch_model_sweep() -> Result<()> {
             tune_cache: cache.clone(),
             attention_tile: 512,
             vision_dtype: Default::default(),
+            mtp_draft: 0,
+            mtp_p_min: 0.,
+            mtp_sampling: Default::default(),
         })?;
         model.reserve(tokens.len() + continuation.len())?;
         let loaded_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -360,6 +366,9 @@ fn large_ubatch_attention_splitting() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     };
     configure_cpu(&mut options)?;
     let full_backend = Backend::new(&options, 15)?;

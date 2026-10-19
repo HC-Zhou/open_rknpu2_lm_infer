@@ -8,8 +8,11 @@ use crate::{
     ops::norm,
 };
 use crate::{
-    model::{cpu::Cpu, projection::Projection},
-    npu::{Attention, Linear},
+    model::{
+        cpu::Cpu,
+        projection::{Linear, Projection},
+    },
+    npu::Attention,
 };
 use anyhow::Result;
 
@@ -24,6 +27,7 @@ pub(super) struct Execution<'a> {
     pub index: i32,
     pub trace: &'a Trace,
     pub rope_positions: &'a [[usize; 3]],
+    pub verify: bool,
 }
 
 pub(super) enum Mixer {
@@ -52,16 +56,16 @@ pub(super) struct Buffers {
     pub hidden: Vec<f32>,
     pub normalized: Vec<f32>,
     projected: Vec<f32>,
-    mixed: Vec<f32>,
+    pub(super) mixed: Vec<f32>,
     query: Vec<f32>,
-    key: Vec<f32>,
-    value: Vec<f32>,
+    pub(super) key: Vec<f32>,
+    pub(super) value: Vec<f32>,
     gate: Vec<f32>,
-    norm_temp: Vec<f32>,
+    pub(super) norm_temp: Vec<f32>,
     attended: Vec<f32>,
     gate_up: Vec<f32>,
     middle: Vec<f32>,
-    scatter: Vec<f32>,
+    pub(super) scatter: Vec<f32>,
     pub recurrent: Scratch,
 }
 

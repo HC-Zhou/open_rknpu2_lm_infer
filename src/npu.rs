@@ -1037,6 +1037,9 @@ mod tests {
             tune_cache: cache.into(),
             attention_tile: 256,
             vision_dtype: Default::default(),
+            mtp_draft: 0,
+            mtp_p_min: 0.,
+            mtp_sampling: Default::default(),
         };
         configure_cpu(&mut options)?;
         Ok(options)

@@ -34,6 +34,9 @@ fn npu_prefill_threshold_state_handoff_and_layer_reuse() -> Result<()> {
         tune_cache: Default::default(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     };
     crate::npu::configure_cpu(&mut options)?;
     let device = Backend::new(&options, 12)?;

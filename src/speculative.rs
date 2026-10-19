@@ -2,6 +2,8 @@
 //! Sampling processors and streaming/stop handling remain engine responsibilities.
 
 use anyhow::{Result, ensure};
+mod driver;
+pub use driver::{DraftOptions, VerifiedRound, run_round, run_round_with_options};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundPlan {

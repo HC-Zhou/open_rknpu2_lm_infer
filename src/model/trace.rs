@@ -4,6 +4,11 @@ use std::{io::Write, path::PathBuf};
 pub(crate) struct Trace(Option<PathBuf>);
 
 impl Trace {
+    #[cfg(test)]
+    pub fn in_directory(path: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(Some(path)))
+    }
     pub fn from_environment() -> Result<Self> {
         let directory = std::env::var_os("OPEN_RKNPU2_TRACE_DIR")
             .filter(|path| !path.is_empty())

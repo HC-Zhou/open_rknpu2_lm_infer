@@ -2,6 +2,8 @@
 
 日期：2026-10-17，Asia/Shanghai（UTC+08:00）。本报告覆盖真实混合 W4/W8 checkpoint 的普通文本推理与端到端 PPL。
 
+2026-10-19 补充：上述结果保留旧库测量身份。后续发现公共 causal LUT 的 masked-future carrier 舍入问题，也适用于普通 prefill；根因、修复及新的回归边界见 [Attention 精度审计](QWEN35_BATCH_ATTENTION_PRECISION_AUDIT.md)。历史 PPL 和优化前后逐值对照不能替代 masked-future 不变性检查。carrier修复后、CPU数值分段修复前，同一32窗口/8160目标PPL为8.579026274，与FP32参考相差−0.26456%；记录见MTP运行时报告。按用户要求，CPU数值分段修复未扩展普通prefill/PPL测量。
+
 ## Checkpoint 与实现
 
 - 服务器目录：`/data007/zt/llm/w4a8_quant/transfer/qwen35/models/C7`。本机共享挂载为 `/home/zt/mnt/3090x4`，备用1挂载为 `/home/firefly/mnt/3090x4`。

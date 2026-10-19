@@ -3,8 +3,13 @@ use serde_json::{Value, json};
 
 impl Qwen35 {
     pub(super) fn statistics(&self) -> Value {
-        let mut result = crate::model::metrics::backend_stats(&self.backends, self.head.backend());
+        let mut backends = self.backends.clone();
+        if let Some(mtp) = &self.mtp {
+            backends.push(mtp.backend.clone());
+        }
+        let mut result = crate::model::metrics::backend_stats(&backends, self.head.backend());
         let mut state_bytes = 0;
+        let mut verification_state_bytes = 0;
         let mut conv_bytes = 0;
         let mut log_bytes = 0;
         let mut kv_bytes = 0;
@@ -13,6 +18,7 @@ impl Qwen35 {
                 Mixer::Recurrent { state, .. } => {
                     let memory = state.memory_usage();
                     state_bytes += memory.canonical_state_bytes;
+                    verification_state_bytes += memory.verification_state_bytes;
                     conv_bytes += memory.convolution_history_bytes;
                     log_bytes += memory.update_log_bytes;
                 }
@@ -25,11 +31,11 @@ impl Qwen35 {
             "position":self.position,"layers":self.layers.len(),"architecture":"qwen3_5",
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "gdn_state_bytes":state_bytes,"gdn_convolution_bytes":conv_bytes,"gdn_update_log_bytes":log_bytes,
+            "gdn_verification_state_bytes":verification_state_bytes,
             "cpu_scratch_bytes":self.work.allocated_bytes()+self.logits.capacity()*4,"attention_cache_payload_bytes":kv_bytes,
             "mapped_weight_bytes":self.loader.store.mapped_bytes(),
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
             "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
-            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":false,
             "multimodal_enabled":self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":self.vision.is_some(),"next_rope_position":self.next_rope_position,
             "vision_encoder_calls":self.vision.as_ref().map_or(0,|v|v.calls),"vision_cache_hits":self.vision.as_ref().map_or(0,|v|v.hits),
             "vision_dtype":self.options.vision_dtype.as_str(),
@@ -43,6 +49,19 @@ impl Qwen35 {
             .as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
+        let speculative = json!({
+            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some(),
+            "mtp_draft_tokens":self.mtp.as_ref().map_or(0,|m|m.max_draft),
+            "spec_draft_n_max":self.mtp.as_ref().map_or(0,|m|m.max_draft),
+            "spec_type":if self.mtp.is_some() {"draft-mtp"} else {"none"},
+            "spec_draft_p_min":self.options.mtp_p_min,"spec_draft_keep_low_confidence":false,
+            "spec_draft_sampling":self.options.mtp_sampling.as_str(),"spec_draft_confidence_top_k":10,
+            "mtp_decoder_ms":self.mtp.as_ref().map_or(0.,|m|m.elapsed_ms),
+        });
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(speculative.as_object().unwrap().clone());
         result.as_object_mut().unwrap().extend(
             serde_json::to_value(&self.phases)
                 .expect("finite stage totals")

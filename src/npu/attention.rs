@@ -267,6 +267,60 @@ impl Attention {
             "reserve native KV cache",
         )
     }
+    /// Append already projected/normalized/rotated KV without computing QK/PV.
+    pub fn append(&self, k: &[f32], v: &[f32], rows: usize, position: usize) -> Result<()> {
+        let mut b = self.owner.0.borrow_mut();
+        self.append_impl(&mut b, k, v, rows, position)
+    }
+    fn append_impl(
+        &self,
+        b: &mut BackendInner,
+        k: &[f32],
+        v: &[f32],
+        rows: usize,
+        position: usize,
+    ) -> Result<()> {
+        let (kh, d) = (self.kv_heads, self.dimension);
+        ensure!(
+            rows > 0 && rows <= b.options.chunk && position + rows <= b.options.context,
+            "native KV append capacity exceeded"
+        );
+        ensure!(
+            k.len() == rows * kh * d && v.len() == rows * kh * d,
+            "native KV append shape mismatch"
+        );
+        let mut info = rk_npu_attention_f16_cache_info::default();
+        check(
+            unsafe { rk_npu_attention_f16_cache_get_info(self.cache.raw, &mut info) },
+            "native KV position",
+        )?;
+        ensure!(
+            info.length as usize == position,
+            "native KV cache position mismatch"
+        );
+        let work = b.attention.as_mut().unwrap();
+        for h in 0..kh {
+            for r in 0..rows {
+                let source = (r * kh + h) * d;
+                let target = (h * rows + r) * d;
+                pack_half(&k[source..source + d], &mut work.k[target..target + d])?;
+                pack_half(&v[source..source + d], &mut work.v[target..target + d])?;
+            }
+        }
+        check(
+            unsafe {
+                rk_npu_attention_f16_cache_append(
+                    b.context.raw,
+                    self.cache.raw,
+                    work.k.as_ptr(),
+                    work.v.as_ptr(),
+                    rows as i32,
+                )
+            },
+            "append native KV",
+        )?;
+        Ok(())
+    }
     pub fn run(
         &self,
         q: &[f32],
@@ -289,37 +343,15 @@ impl Attention {
                 && v.len() >= rows * kh * d,
             "attention input/output shape mismatch"
         );
-        let mut info = rk_npu_attention_f16_cache_info::default();
-        check(
-            unsafe { rk_npu_attention_f16_cache_get_info(self.cache.raw, &mut info) },
-            "native KV position",
+        self.append_impl(
+            &mut b,
+            &k[..rows * kh * d],
+            &v[..rows * kh * d],
+            rows,
+            position,
         )?;
-        ensure!(
-            info.length as usize == position,
-            "native KV cache position mismatch"
-        );
         let context = b.context.raw;
         let work = b.attention.as_mut().unwrap();
-        for h in 0..kh {
-            for r in 0..rows {
-                let source = (r * kh + h) * d;
-                let target = (h * rows + r) * d;
-                pack_half(&k[source..source + d], &mut work.k[target..target + d])?;
-                pack_half(&v[source..source + d], &mut work.v[target..target + d])?;
-            }
-        }
-        check(
-            unsafe {
-                rk_npu_attention_f16_cache_append(
-                    context,
-                    self.cache.raw,
-                    work.k.as_ptr(),
-                    work.v.as_ptr(),
-                    rows as i32,
-                )
-            },
-            "append native KV",
-        )?;
         let step = work.config.max_query_rows as usize;
         for offset in (0..rows).step_by(step) {
             let m = step.min(rows - offset);

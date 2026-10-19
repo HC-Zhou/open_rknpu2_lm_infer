@@ -12,6 +12,8 @@ def main():
     parser.add_argument("actual", type=Path)
     parser.add_argument("--position", type=int, default=0)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--actual-rows", type=int, default=1,
+                        help="compare first row of a batched trace with a single-row reference")
     args = parser.parse_args()
     report = []
     for layer in range(32):
@@ -21,6 +23,8 @@ def main():
             if not (ref.exists() and actual.exists()):
                 continue
             a, b = np.fromfile(ref, dtype="<f4"), np.fromfile(actual, dtype="<f4")
+            if args.actual_rows > 1 and len(b) == len(a) * args.actual_rows:
+                b = b[:len(a)]
             if a.shape != b.shape:
                 report.append(dict(layer=layer, stage=stage, shape_match=False,
                                    reference_elements=len(a), actual_elements=len(b)))

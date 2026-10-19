@@ -127,6 +127,7 @@ pub struct LayerState {
     dim: GdnDimensions,
     kernel: usize,
     state: Vec<f32>,
+    verified_state: Vec<f32>,
     conv: ConvState,
     position: usize,
     max_verify_rows: usize,
@@ -137,6 +138,7 @@ pub struct LayerState {
 #[derive(Debug, Serialize)]
 pub struct MemoryUsage {
     pub canonical_state_bytes: usize,
+    pub verification_state_bytes: usize,
     pub convolution_history_bytes: usize,
     pub update_log_bytes: usize,
 }
@@ -157,6 +159,7 @@ impl LayerState {
             dim,
             kernel,
             state: vec![0.0; dim.state_elements()],
+            verified_state: Vec::new(),
             conv: ConvState::new(dim.conv_width(), kernel)?,
             position: 0,
             max_verify_rows,
@@ -179,6 +182,7 @@ impl LayerState {
     pub fn memory_usage(&self) -> MemoryUsage {
         MemoryUsage {
             canonical_state_bytes: self.state.capacity() * 4,
+            verification_state_bytes: self.verified_state.capacity() * 4,
             convolution_history_bytes: self.conv.allocated_bytes(),
             update_log_bytes: self.log.allocated_bytes(),
         }
@@ -309,6 +313,10 @@ impl LayerState {
             "GDN verification exceeds reserved window"
         );
         self.compute(pool, weights, input, scratch)?;
+        // Retain the computed endpoint by swapping buffers, without a second
+        // state copy. Full acceptance can commit it directly; partial prefixes
+        // still use compact replay. Ordinary AR allocates no endpoint buffer.
+        std::mem::swap(&mut self.verified_state, &mut scratch.state);
         self.log.record(&scratch.mixer, input);
         self.pending = Some(input.rows);
         Ok(scratch.mixer.output())
@@ -324,8 +332,12 @@ impl LayerState {
             (1..=rows).contains(&consumed_rows),
             "invalid GDN commit boundary"
         );
-        let updates = self.log.updates(rows).prefix(self.dim, consumed_rows)?;
-        gated_delta::replay(pool, self.dim, &mut self.state, updates)?;
+        if consumed_rows == rows {
+            std::mem::swap(&mut self.state, &mut self.verified_state);
+        } else {
+            let updates = self.log.updates(rows).prefix(self.dim, consumed_rows)?;
+            gated_delta::replay(pool, self.dim, &mut self.state, updates)?;
+        }
         self.conv
             .append(&self.log.conv_input[..consumed_rows * self.dim.conv_width()])?;
         self.position += consumed_rows;

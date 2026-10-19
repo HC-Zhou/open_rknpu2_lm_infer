@@ -12,6 +12,10 @@ pub(super) struct PrefixCache {
     pub logits: Vec<f32>,
 }
 impl PrefixCache {
+    #[cfg(test)]
+    pub(super) fn rows_len(&self) -> usize {
+        self.rows.len()
+    }
     pub fn clear(&mut self) {
         self.rows.clear();
         self.logits.clear();

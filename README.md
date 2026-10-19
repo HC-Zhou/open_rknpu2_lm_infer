@@ -73,7 +73,9 @@
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
-An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. Qwen3.5 checkpoints with BF16 vision weights also support static images, multiple images and image history through the CLI, terminal chat and OpenAI chat API. See the [C7 text validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) and [vision usage and validation](llm_generated_docs/QWEN35_VISION_PROGRESS.md). MTP generation and video are pending.
+An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. Qwen3.5 checkpoints with BF16 vision weights also support static images, multiple images and image history through the CLI, terminal chat and OpenAI chat API. See the [C7 text validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) and [vision usage and validation](llm_generated_docs/QWEN35_VISION_PROGRESS.md). Video is pending.
+
+For a Qwen3.5 checkpoint containing its single MTP layer and shared embedding/output head, enable speculative generation with `--spec-type draft-mtp` on `run`, `chat` or `serve`. The llama.cpp-style options are `--spec-draft-n-max` (default 3, supported range 0–7), `--spec-draft-p-min` (default 0) and `--spec-draft-sampling greedy|probabilistic` (default greedy). A nonzero maximum must be smaller than `--ubatch-size`. Confidence uses the draft's top-10 candidate probabilities; a candidate below the threshold is discarded and drafting stops. Greedy drafts use target sample-and-match verification; probabilistic drafts use exact rejection sampling. MTP is disabled by default (`--spec-type none`). Rotated C7 checkpoints require their supplied `mtp_coordinate_adapter.json`. See the [commands, numerical checks and measurements](llm_generated_docs/QWEN35_MTP_RUNTIME.md).
 
 Qwen3.5 GDN uses the NPU for actual prefill windows above 12 tokens on supported Hk16/Hv32, Dk128/Dv128, K4 shapes. Smaller windows and decode use the CPU. NPU products use ordinary TF32 with FP32 canonical state shared with CPU decode. See [routing, precision and measurements](llm_generated_docs/QWEN35_NPU_GDN_PREFILL.md), including the short-window performance tradeoff.
 
@@ -183,4 +185,4 @@ for chunk in stream:
 
 ## License
 
-[AGPL-3.0-only](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the operator library's provenance and licensing boundaries.
+[AGPL-3.0-only](LICENSE). See [THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md) for provenance and third-party notices.

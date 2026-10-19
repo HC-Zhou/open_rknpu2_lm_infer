@@ -17,6 +17,10 @@ impl Qwen35 {
     ) -> Result<()> {
         input.validate()?;
         ensure!(
+            self.round.is_none(),
+            "Qwen3.5 verification transaction is active"
+        );
+        ensure!(
             start == self.position
                 && start < input.tokens.len()
                 && input.positions.len() == input.tokens.len(),

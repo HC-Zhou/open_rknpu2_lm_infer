@@ -20,6 +20,7 @@ pub struct FloatBackend {
     device: Backend,
     dtype: rk_npu_mm_dtype,
     host_type: rk_npu_mm_host_type,
+    decoder: bool,
 }
 pub struct FloatLinear {
     weight: Handle<rk_npu_mm_tuned_weights>,
@@ -66,6 +67,13 @@ impl FloatBackend {
     pub fn new(device: Backend) -> Self {
         Self::with_dtype(device, RK_NPU_MM_F16)
     }
+    /// FP16 auxiliary decoder matrices. Cache misses use short M tiles and
+    /// distribute independent output channels across the permitted NPU cores.
+    pub fn for_decoder(device: Backend) -> Self {
+        let mut backend = Self::new(device);
+        backend.decoder = true;
+        backend
+    }
     /// Native BF16 arithmetic and resident BF16 weights, with FP32 host IO.
     pub fn bf16(device: Backend) -> Self {
         Self::with_dtype(device, RK_NPU_MM_BF16)
@@ -82,6 +90,7 @@ impl FloatBackend {
             device,
             dtype,
             host_type: RK_NPU_MM_HOST_F32,
+            decoder: false,
         }
     }
     /// Search is controlled by the explicit tune_search option. Ordinary
@@ -156,6 +165,15 @@ impl FloatBackend {
                 found = true;
             }
         }
+        if found
+            && self.decoder
+            && (strategy.options.n_tile > 4096 || (strategy.options.n_tile == 0 && n > 4096))
+        {
+            // Keep the validated mixed FP16/INT8 recipe even when a
+            // float-only profile selected a wider output-channel task.
+            found = false;
+            b.fallback_calls += 1;
+        }
         if found && !weight.is_null() {
             let rc = unsafe { rk_npu_mm_tuned_weights_match(weight, &strategy) };
             if rc != 0 {
@@ -169,6 +187,15 @@ impl FloatBackend {
                 unsafe { rk_npu_mm_strategy_default(&cfg, &mut strategy) },
                 "default floating strategy",
             )?;
+            // The library baseline reserves 128 physical rows even for one
+            // logical token. Wide auxiliary projections need only their real
+            // rows; keeping the tile small also bounds the input CBUF footprint.
+            if self.decoder {
+                strategy.m_tile = rows.clamp(8, 32) as i32;
+                let cores = b.options.npu_mask.count_ones() as usize;
+                strategy.options.n_tile =
+                    n.div_ceil(cores).div_ceil(32).saturating_mul(32).min(4096) as i32;
+            }
         }
         let mut raw = ptr::null_mut();
         check(
@@ -381,7 +408,7 @@ impl FloatLinear {
                     std::mem::size_of_val(output) as u64,
                 )
             },
-            "floating Linear run",
+            &format!("floating Linear M={rows} K={} N={}", self.k, self.n),
         )
     }
 }

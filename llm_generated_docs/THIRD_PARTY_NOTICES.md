@@ -16,6 +16,19 @@ Upstream license: https://www.apache.org/licenses/LICENSE-2.0
 
 ## llama.cpp / ggml
 
+The Qwen3.5 NextN graph and normalized hidden-state handoff were checked
+against `src/models/qwen35.cpp` and `common/speculative.cpp` at local reference
+revision `de3ebb93bd8828496faefb44ed45059ec7ed3ea5`:
+[Qwen3.5 graph](https://github.com/ggml-org/llama.cpp/blob/a17e94d229fc7fed1567a799baebd11b771fe5af/src/models/qwen35.cpp)
+(unchanged between that upstream revision and the local reference).
+The Rust MTP adapter uses the same embedding-first concatenation and gated
+full-attention block. Prompt shift and canonical draft repair are additionally
+checked against the supplied C7 Transformers reference. The implementation
+shares its target decoder and public NPU operators rather than copying ggml.
+The speculative CLI names, top-10 draft candidate chain, confidence stop,
+greedy sample-and-match and optional probabilistic rejection follow the same
+`common/speculative.cpp` reference. Target sampling uses this runtime's RNG.
+
 The FP32 gated delta recurrence in `native/cpu_kernels/`, called through
 `src/ops/gated_delta.rs` and `src/ops/gated_delta/native.rs`, adapts the head/window loop and transposed state
 organization of `ggml_compute_forward_gated_delta_net_one_chunk` from

@@ -2,7 +2,7 @@ mod tune;
 use crate::{
     engine::{Engine, GenerationEvent, GenerationRequest, Prompt},
     model::{ModelOptions, VisionDtype},
-    sampling::SamplingParams,
+    sampling::{DraftSampling, SamplingParams},
     text::TextCodec,
 };
 use anyhow::{Context, Result, bail};
@@ -74,6 +74,36 @@ pub struct ModelArgs {
         help = "ViT intermediate tensor dtype; NPU matmul remains FP16"
     )]
     pub vision_dtype: VisionDtype,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "none",
+        help = "Speculative decoding type; draft-mtp requires a Qwen3.5 MTP checkpoint"
+    )]
+    pub spec_type: SpeculativeType,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 3,
+        help = "Maximum MTP draft tokens (0..7), smaller than ubatch-size; 0 disables"
+    )]
+    pub spec_draft_n_max: usize,
+    #[arg(
+        long,
+        visible_alias = "draft-p-min",
+        global = true,
+        default_value_t = 0.,
+        help = "Minimum draft candidate probability (0..1); discard below it and stop"
+    )]
+    pub spec_draft_p_min: f64,
+    #[arg(long, global = true, value_enum, default_value = "greedy")]
+    pub spec_draft_sampling: DraftSampling,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SpeculativeType {
+    None,
+    DraftMtp,
 }
 fn parse_u64(s: &str) -> std::result::Result<u64, String> {
     if let Some(s) = s.strip_prefix("0x") {
@@ -87,7 +117,29 @@ fn parse_u32(s: &str) -> std::result::Result<u32, String> {
     u32::try_from(parse_u64(s)?).map_err(|e| e.to_string())
 }
 impl ModelArgs {
+    fn validate_command(&self, command: &Command) -> Result<()> {
+        if self.spec_type == SpeculativeType::DraftMtp
+            && self.spec_draft_n_max > 0
+            && matches!(
+                command,
+                Command::Bench(_)
+                    | Command::Eval { .. }
+                    | Command::Ppl { .. }
+                    | Command::Tune { .. }
+            )
+        {
+            bail!(
+                "MTP generation applies to run, chat and serve; use --spec-type none for fixed-token evaluation and tuning"
+            );
+        }
+        Ok(())
+    }
+
     pub fn options(&self) -> Result<ModelOptions> {
+        anyhow::ensure!(
+            self.spec_draft_n_max <= 7,
+            "spec-draft-n-max must be in 0..7"
+        );
         let path = self
             .model
             .clone()
@@ -105,7 +157,7 @@ impl ModelArgs {
         if self.npu_mask == 0 || self.npu_mask > 7 {
             bail!("npu-mask must select one or more of the three NPU cores (1..7)");
         }
-        Ok(ModelOptions {
+        let options = ModelOptions {
             path,
             context,
             chunk: self.chunk,
@@ -117,7 +169,16 @@ impl ModelArgs {
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,
-        })
+            mtp_draft: if self.spec_type == SpeculativeType::DraftMtp {
+                self.spec_draft_n_max
+            } else {
+                0
+            },
+            mtp_p_min: self.spec_draft_p_min,
+            mtp_sampling: self.spec_draft_sampling,
+        };
+        options.validate_mtp()?;
+        Ok(options)
     }
 }
 fn default_tune_cache() -> PathBuf {
@@ -404,6 +465,7 @@ fn prompt(text: String, chat: bool, thinking: bool) -> Prompt {
 }
 pub async fn execute(cli: Cli) -> Result<()> {
     let mut model_args = cli.model;
+    model_args.validate_command(&cli.command)?;
     let bench_cases = if let Command::Bench(args) = &cli.command {
         let cases = args.cases()?;
         if model_args.context == 0 {
@@ -563,6 +625,143 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
+    }
+
+    #[test]
+    fn mtp_options_validate_before_loading_a_checkpoint() {
+        let cli = parse(&["infer", "-m", "model", "run"]);
+        assert_eq!(cli.model.spec_type, SpeculativeType::None);
+        assert_eq!(cli.model.spec_draft_n_max, 3);
+        assert_eq!(cli.model.spec_draft_sampling, DraftSampling::Greedy);
+        let options = cli.model.options().unwrap();
+        assert_eq!(options.mtp_draft, 0);
+        assert_eq!(options.mtp_p_min, 0.);
+        let disabled = parse(&[
+            "infer",
+            "-m",
+            "model",
+            "run",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "0",
+        ]);
+        assert_eq!(disabled.model.options().unwrap().mtp_draft, 0);
+        let alias = parse(&[
+            "infer",
+            "-m",
+            "model",
+            "run",
+            "--spec-type",
+            "draft-mtp",
+            "--draft-p-min",
+            "0.5",
+            "--spec-draft-sampling",
+            "probabilistic",
+        ]);
+        assert_eq!(alias.model.options().unwrap().mtp_p_min, 0.5);
+        assert_eq!(
+            alias.model.options().unwrap().mtp_sampling,
+            DraftSampling::Probabilistic
+        );
+        for command in ["run", "chat", "serve"] {
+            let cli = parse(&[
+                "infer",
+                "-m",
+                "model",
+                command,
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+                "--spec-draft-p-min",
+                "0.75",
+            ]);
+            cli.model.validate_command(&cli.command).unwrap();
+            let options = cli.model.options().unwrap();
+            assert_eq!(options.mtp_draft, 3);
+            assert_eq!(options.mtp_p_min, 0.75);
+        }
+        for flags in [
+            vec!["--spec-type", "draft-mtp", "--spec-draft-n-max", "8"],
+            vec!["--spec-draft-p-min", "0.5"],
+            vec![
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+                "--spec-draft-p-min",
+                "NaN",
+            ],
+            vec![
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+                "--spec-draft-p-min",
+                "1.1",
+            ],
+            vec![
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+                "--spec-draft-p-min=-0.1",
+            ],
+            vec![
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+                "--ubatch-size",
+                "3",
+            ],
+        ] {
+            let mut args = vec!["infer", "-m", "model", "run"];
+            args.extend(flags);
+            assert!(parse(&args).model.options().is_err(), "{args:?}");
+        }
+        for command in [
+            vec!["bench"],
+            vec!["tune"],
+            vec!["ppl", "--tokens-file", "ids.json", "--report", "ppl.json"],
+            vec![
+                "eval",
+                "--tokens-file",
+                "ids.json",
+                "--dump-logits",
+                "logits.f32",
+            ],
+        ] {
+            let mut args = vec![
+                "infer",
+                "-m",
+                "model",
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "3",
+            ];
+            args.extend(command);
+            let cli = parse(&args);
+            assert!(cli.model.validate_command(&cli.command).is_err());
+        }
+        let cli = parse(&[
+            "infer",
+            "-m",
+            "model",
+            "run",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "3",
+        ]);
+        let mut options = cli.model.options().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+        options.path = dir.path().to_owned();
+        let error = crate::model::load(options).err().unwrap();
+        assert!(error.to_string().contains("only for Qwen3.5"));
     }
 
     #[test]

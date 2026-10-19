@@ -42,6 +42,27 @@ pub struct ModelOptions {
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
+    pub mtp_draft: usize,
+    pub mtp_p_min: f64,
+    pub mtp_sampling: crate::sampling::DraftSampling,
+}
+impl ModelOptions {
+    pub(crate) fn validate_mtp(&self) -> Result<()> {
+        anyhow::ensure!(self.mtp_draft <= 7, "spec-draft-n-max must be in 0..7");
+        anyhow::ensure!(
+            self.mtp_draft == 0 || self.mtp_draft < self.chunk,
+            "spec-draft-n-max must be smaller than ubatch-size"
+        );
+        anyhow::ensure!(
+            self.mtp_p_min.is_finite() && (0. ..=1.).contains(&self.mtp_p_min),
+            "spec-draft-p-min must be finite and in [0,1]"
+        );
+        anyhow::ensure!(
+            self.mtp_p_min == 0. || self.mtp_draft > 0,
+            "spec-draft-p-min requires --spec-type draft-mtp and spec-draft-n-max greater than zero"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +117,43 @@ pub trait LanguageModel {
         self.forward(tokens)
     }
     fn position(&self) -> usize;
+    /// Optional NextN capability. Enabling before prefill builds the complete
+    /// shifted draft prompt history alongside target execution.
+    /// Configure proposals before prefill; Qwen3.5 accepts zero to disable MTP.
+    fn enable_mtp(&mut self, _max_draft: usize) -> Result<()> {
+        anyhow::bail!("this model does not support MTP")
+    }
+    fn speculation_window(&self) -> usize {
+        0
+    }
+    /// Minimum top-candidate probability required to admit the current draft.
+    /// Zero disables confidence truncation.
+    fn speculation_p_min(&self) -> f64 {
+        0.
+    }
+    fn speculation_sampling(&self) -> crate::sampling::DraftSampling {
+        crate::sampling::DraftSampling::Greedy
+    }
+    fn draft_logits(
+        &mut self,
+        _token: u32,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<&[f32]> {
+        anyhow::bail!("this model does not support MTP")
+    }
+    fn verify_tokens(
+        &mut self,
+        _tokens: &[u32],
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<&[f32]> {
+        anyhow::bail!("this model does not support target verification")
+    }
+    fn finish_verification(&mut self, _consumed: usize) -> Result<()> {
+        anyhow::bail!("this model does not support target verification")
+    }
+    fn abort_verification(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Score the next-token targets for every input row, retaining the KV prefix.
     fn token_nll(&mut self, tokens: &[u32], targets: &[u32]) -> Result<Vec<f64>> {
         anyhow::ensure!(
@@ -119,14 +177,28 @@ pub trait LanguageModel {
 }
 
 pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
-    crate::npu::configure_cpu(&mut options)?;
+    options.validate_mtp()?;
+    let mtp_draft = options.mtp_draft;
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
-    match config["model_type"].as_str() {
-        Some("qwen3" | "llama" | "granite") => Ok(Box::new(dense::Dense::load(options)?)),
-        Some("qwen3_5" | "qwen3_5_text") => Ok(Box::new(qwen35::Qwen35::load(options)?)),
+    anyhow::ensure!(
+        mtp_draft == 0
+            || matches!(
+                config["model_type"].as_str(),
+                Some("qwen3_5" | "qwen3_5_text")
+            ),
+        "MTP is supported only for Qwen3.5 checkpoints"
+    );
+    crate::npu::configure_cpu(&mut options)?;
+    let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
+        Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
+        Some("qwen3_5" | "qwen3_5_text") => Box::new(qwen35::Qwen35::load(options)?),
         other => anyhow::bail!(
             "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text"
         ),
+    };
+    if mtp_draft > 0 {
+        model.enable_mtp(mtp_draft)?;
     }
+    Ok(model)
 }

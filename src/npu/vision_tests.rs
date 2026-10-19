@@ -16,6 +16,9 @@ fn fp16_linear_and_noncausal_attention_match_cpu() -> Result<()> {
         tune_cache: std::path::PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        mtp_draft: 0,
+        mtp_p_min: 0.,
+        mtp_sampling: Default::default(),
     };
     configure_cpu(&mut options)?;
     let device = Backend::new(&options, 11)?;
