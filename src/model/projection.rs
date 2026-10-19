@@ -96,17 +96,7 @@ impl Linear {
                     rows > 0 && input.len().is_multiple_of(rows) && output.len() == rows * n,
                     "invalid floating decoder projection shape"
                 );
-                if rows < 8 {
-                    let k = input.len() / rows;
-                    let mut physical_input = vec![0.; 8 * k];
-                    physical_input[..input.len()].copy_from_slice(input);
-                    let mut physical_output = vec![0.; 8 * n];
-                    linear.run(&physical_input, &mut physical_output, 8)?;
-                    output.copy_from_slice(&physical_output[..output.len()]);
-                    Ok(())
-                } else {
-                    linear.run(input, output, rows)
-                }
+                linear.run(input, output, rows)
             }
         }
     }

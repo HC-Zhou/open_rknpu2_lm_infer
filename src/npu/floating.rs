@@ -191,7 +191,7 @@ impl FloatBackend {
             // logical token. Wide auxiliary projections need only their real
             // rows; keeping the tile small also bounds the input CBUF footprint.
             if self.decoder {
-                strategy.m_tile = rows.clamp(8, 32) as i32;
+                strategy.m_tile = rows.min(32) as i32;
                 let cores = b.options.npu_mask.count_ones() as usize;
                 strategy.options.n_tile =
                     n.div_ceil(cores).div_ceil(32).saturating_mul(32).min(4096) as i32;

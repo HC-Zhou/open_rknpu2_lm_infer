@@ -15,7 +15,7 @@
 - `engine/context.rs`：前缀身份与位置匹配；视觉 feature cache 限定容量。
 - `api/request.rs`：请求解析和 content parts 规范化。
 
-固定参考：Transformers `09281b8d56b08199ce9f397c694f38853cc45278` 的 Qwen3.5 和 Qwen2-VL processor。ViT MLP 使用 tanh GELU，merger 使用精确 GELU，二者不可混用。图像 resize 以该版本的 PIL backend 对照；默认每图最多256个视觉 token（1024个16×16 patch），最小像素面积沿用 C7 的65536，以适配板端预算。处理参数参与图像身份。
+固定参考：Transformers `09281b8d56b08199ce9f397c694f38853cc45278` 的 Qwen3.5 和 Qwen2-VL processor。ViT MLP 使用 tanh GELU，merger 使用精确 GELU，二者不可混用。图像 resize 以该版本的 PIL backend 对照；像素面积上下限读取 checkpoint 的 `size.shortest_edge` / `size.longest_edge`，不另设运行时 patch/token 上限。C7 配置为65536–16777216像素，保持纵横比并将宽高对齐到32像素。处理参数参与图像身份。
 
 ## 使用
 
@@ -46,7 +46,7 @@ open_rknpu2_lm_infer --model MODEL run \
 
 图像支持 PNG/JPEG，`image_url.detail` 只支持省略或 `auto`；远程 URL、视频和 system/assistant 图像返回明确错误。多轮请求由调用者发送完整 messages，历史图像也用相同 content parts 传回。API 不自动删除历史；展开后的视觉 token 与文字 token 一起占用上下文，再预留 `max_tokens`，超限返回400。
 
-默认每图最多256个视觉 token、每会话最多8图，单图编码数据≤8 MiB、请求图像数据合计≤16 MiB，HTTP body≤24 MiB；解码维度和内存另有限制。特征 LRU cache 上限32 MiB，缓存身份包括处理后的像素、grid及归一化参数。KV 前缀逐行比较token、三轴位置及图像身份；新图不能通过相同 image-pad IDs 复用旧 KV。当前 GDN 不能回退至任意非零前缀，分叉历史通过 reset/recompute 恢复，已有视觉 features 仍可复用。
+每张图的视觉 token 数为 resize 后 patch 数除以4，与文字及生成预算共同占用上下文。每会话最多8图，单图编码数据≤8 MiB、请求图像数据合计≤16 MiB，HTTP body≤24 MiB；解码维度和内存另有限制。特征 LRU cache 上限32 MiB，缓存身份包括处理后的像素、grid及归一化参数。KV 前缀逐行比较token、三轴位置及图像身份；新图不能通过相同 image-pad IDs 复用旧 KV。当前 GDN 不能回退至任意非零前缀，分叉历史通过 reset/recompute 恢复，已有视觉 features 仍可复用。
 
 ## 已完成的验证
 

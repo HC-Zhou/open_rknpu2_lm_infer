@@ -8,7 +8,6 @@ use std::{io::Cursor, path::Path, sync::Arc};
 pub const MAX_IMAGES: usize = 8;
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_PATCHES: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
@@ -25,9 +24,8 @@ impl PreparedImage {
                 && w >= 2
                 && h.is_multiple_of(2)
                 && w.is_multiple_of(2)
-                && h.checked_mul(w).is_some_and(
-                    |n| n <= MAX_PATCHES && n.checked_mul(1536) == Some(self.patches.len())
-                ),
+                && h.checked_mul(w)
+                    .is_some_and(|n| n.checked_mul(1536) == Some(self.patches.len())),
             "invalid prepared image geometry"
         );
         ensure!(
@@ -78,8 +76,7 @@ impl ImageProcessor {
         );
         let max_pixels = p["size"]["longest_edge"]
             .as_u64()
-            .context("missing image max pixels")?
-            .min((MAX_PATCHES * 256) as u64) as usize;
+            .context("missing image max pixels")? as usize;
         let min_pixels = p["size"]["shortest_edge"]
             .as_u64()
             .context("missing image min pixels")? as usize;
@@ -126,10 +123,6 @@ impl ImageProcessor {
         let (sw, sh) = decoded.dimensions();
         let (height, width) =
             smart_resize(sh as usize, sw as usize, self.min_pixels, self.max_pixels)?;
-        ensure!(
-            (height / 16) * (width / 16) <= MAX_PATCHES,
-            "resized image exceeds patch budget"
-        );
         let rgb = super::resize::bicubic(decoded, width as u32, height as u32);
         let (gh, gw) = (height / 16, width / 16);
         let mut patches = Vec::with_capacity(gh * gw * 1536);

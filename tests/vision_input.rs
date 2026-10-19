@@ -84,6 +84,27 @@ fn malformed_sources_and_extreme_dimensions_fail_before_device_work() -> Result<
 }
 
 #[test]
+fn image_resolution_follows_the_checkpoint_pixel_budget() -> Result<()> {
+    let (dir, p) = processor()?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(1024, 768).write_to(&mut encoded, image::ImageFormat::Png)?;
+    let image = p.prepare(encoded.get_ref())?;
+    assert_eq!(image.grid, [1, 48, 64]);
+    assert_eq!(image.tokens(), 768);
+    image.validate()?;
+
+    let path = dir.path().join("preprocessor_config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    config["size"]["longest_edge"] = (512 * 512).into();
+    std::fs::write(path, serde_json::to_vec(&config)?)?;
+    let limited = ImageProcessor::load(dir.path())?.unwrap();
+    let image = limited.prepare(encoded.get_ref())?;
+    assert_eq!(image.grid, [1, 26, 36]);
+    assert_eq!(image.tokens(), 234);
+    Ok(())
+}
+
+#[test]
 fn jpeg_camera_orientation_precedes_resize_and_patchification() -> Result<()> {
     let (_dir, p) = processor()?;
     let image = p.prepare(include_bytes!("fixtures/vision/jpeg-orientation.jpg"))?;

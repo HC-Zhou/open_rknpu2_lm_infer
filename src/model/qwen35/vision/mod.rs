@@ -21,8 +21,8 @@ pub fn tuning_shapes(path: &std::path::Path, rows: &[usize]) -> anyhow::Result<V
     let mut shapes = Vec::new();
     for &m in rows {
         anyhow::ensure!(
-            m > 0 && m <= crate::vision::MAX_PATCHES && m.is_multiple_of(4),
-            "vision patch rows must be a multiple of four within 4..1024"
+            m > 0 && m.is_multiple_of(4),
+            "vision patch rows must be a positive multiple of four"
         );
         let h = c.hidden;
         for (name, rows, k, n) in [
@@ -89,7 +89,9 @@ mod tests {
         assert_eq!((shapes[4].k, shapes[4].n), (2048, 512));
         assert_eq!((shapes[5].rows, shapes[5].k, shapes[5].n), (96, 2048, 2048));
         assert!(tuning_shapes(dir.path(), &[3]).is_err());
-        assert!(tuning_shapes(dir.path(), &[1028]).is_err());
+        let large = tuning_shapes(dir.path(), &[4096])?;
+        assert_eq!(large[0].rows, 4096);
+        assert_eq!(large[5].rows, 1024);
         Ok(())
     }
 }
