@@ -8,6 +8,9 @@
 ![Rust](https://img.shields.io/badge/rust-1.95-orange)
 ![Platform](https://img.shields.io/badge/platform-RK3588-green)
 
+[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
+[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 </div>
@@ -89,7 +92,16 @@ The engine supports models in the compressed-tensors format with W4A8 or W8A8 li
 
 ## Quick Start
 
-Copy and paste the following commands on an RK3588 Linux board to download the latest [release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) and the Qwen3-4B model, then start a terminal chat session. Supports Debian 11 / glibc 2.31 or newer, with no compilation required.
+You need an RK3588 device running Linux. The current version supports only the vendor's `rknpu2` kernel driver, version 0.9.6 or newer.
+
+Run the following command as root to check the driver version:
+
+```bash
+cat /sys/kernel/debug/rknpu/version
+RKNPU driver: v0.9.8
+```
+
+Then copy and paste the following commands to download the latest [release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) and the Qwen3-4B model, then start a terminal chat session. Supports Debian 11 / glibc 2.31 or newer, with no compilation required.
 
 ```bash
 sudo apt install curl jq python3-pip libgomp1 libstdc++6
@@ -193,6 +205,13 @@ for chunk in stream:
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+## TODO
+
+- Support the upstream `rocket` kernel driver. This may need to wait until NPU DVFS support is more complete.
+- Prefill MFU currently reaches around 20% under favorable conditions, with room for improvement.
+- Support more models, including Transformer models beyond LLMs.
+- Contributions are welcome: fork the project and submit a PR!
 
 ## License
 

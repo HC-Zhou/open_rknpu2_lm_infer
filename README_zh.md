@@ -8,6 +8,9 @@
 ![Rust](https://img.shields.io/badge/rust-1.95-orange)
 ![Platform](https://img.shields.io/badge/platform-RK3588-green)
 
+[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
+[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 </div>
@@ -89,7 +92,13 @@
 
 ## 快速开始
 
-在 RK3588 Linux 板上复制粘贴以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
+你需要一个 Linux 系统的 RK3588 设备。目前版本只支持原厂`rknpu2`内核驱动，且版本必须>=0.9.6。
+使用root权限运行以下命令检查驱动版本:
+```bash
+> cat /sys/kernel/debug/rknpu/version
+RKNPU driver: v0.9.8
+```
+之后，复制粘贴并执行以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
 
 ```bash
 sudo apt install curl jq python3-pip libgomp1 libstdc++6
@@ -193,6 +202,13 @@ for chunk in stream:
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+## TODO
+
+- 支持上游的`rocket`内核态驱动。可能需要等到相关的NPU DVFS完善。
+- 目前的Prefill MFU较好情况下可以达到20%左右，仍有改进空间。
+- 支持更多模型，包括非LLM的Transformer模型。
+- 你也可以动手来改进这个项目。欢迎fork和pr！
 
 ## 许可证
 
