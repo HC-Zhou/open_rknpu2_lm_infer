@@ -1,3 +1,10 @@
+# v0.6.1
+
+- 修复 Qwen3.5 图片超过1024个patch时出现 `invalid full FP16 attention shape` 的问题；视觉 Attention 按预处理后的实际图像长度分配工作区。
+- 使用 `FullAttention` 临时 K/V buffer，在图像的 Transformer blocks 间覆写复用，blocks 完成后释放，独立于文本上下文容量。
+- 同步算子库，移除 Attention 对32768行容量的固定拒绝条件，保留调用方分配边界及实际算子形状、任务数量校验。
+- 板端验证包含原图 FP16/FP32 编码、CLI 问答、固定token文本logits及小图features逐位回归；89项默认测试、2项视觉NPU测试和native Attention CPU contract通过。
+
 # v0.6.0
 
 - 新增 Qwen3.5 混合文本主干、静态图片与多图片输入，CLI、终端聊天和 OpenAI 兼容 API 共用图文历史与前缀缓存。
