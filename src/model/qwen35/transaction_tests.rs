@@ -61,9 +61,7 @@ fn complete_target_commit_abort_and_next_output() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
-        mtp_draft: 0,
-        mtp_p_min: 0.,
-        mtp_sampling: Default::default(),
+        speculation: Default::default(),
     };
     if let Some(path) = std::env::var_os("RKNPU_MTP_TUNE_CACHE") {
         options.tune = true;

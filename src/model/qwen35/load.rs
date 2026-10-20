@@ -279,5 +279,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         next_rope_position: 0,
         round: None,
         mtp: None,
+        features: Default::default(),
+        dflash: None,
     })
 }

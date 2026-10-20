@@ -48,11 +48,20 @@ pub struct Qwen35 {
     pub(super) next_rope_position: usize,
     pub(super) round: Option<super::transaction::Round>,
     pub(super) mtp: Option<super::mtp::Predictor>,
+    pub(super) features: super::features::Features,
+    pub(super) dflash: Option<crate::model::dflash::DFlash>,
 }
 
 impl Qwen35 {
     pub fn load(options: ModelOptions) -> Result<Self> {
-        super::load::load(options)
+        options.validate_speculation()?;
+        let mut model = super::load::load(options)?;
+        if model.options.speculation.kind == crate::model::SpeculativeType::DraftDflash
+            && model.options.speculation.window() > 0
+        {
+            model.load_dflash()?;
+        }
+        Ok(model)
     }
 
     pub(super) fn check_input(&self, tokens: &[u32]) -> Result<()> {
@@ -121,6 +130,7 @@ impl Qwen35 {
             .as_ref()
             .filter(|_| !verify)
             .map(|_| self.work.hidden[..tokens.len() * h].to_vec());
+        self.features.begin(tokens.len());
         for (i, layer) in self.layers.iter_mut().enumerate() {
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -140,6 +150,8 @@ impl Qwen35 {
                 },
                 &mut self.phases,
             )?;
+            self.features
+                .record(i, &self.work.hidden[..tokens.len() * h]);
         }
         if let (Some(mtp), Some(embeddings)) = (&mut self.mtp, embeddings) {
             norm::rms_norm(
@@ -159,6 +171,8 @@ impl Qwen35 {
             )?;
         }
         if !verify {
+            self.features.commit(tokens.len());
+            self.flush_features(cancelled)?;
             self.position += tokens.len();
             self.next_rope_position = rope_positions
                 .iter()
@@ -269,8 +283,12 @@ impl LanguageModel for Qwen35 {
         }
         self.position = 0;
         self.round = None;
+        self.features.reset();
         if let Some(mtp) = &mut self.mtp {
             mtp.reset()?;
+        }
+        if let Some(draft) = &mut self.dflash {
+            draft.reset()?;
         }
         self.next_rope_position = 0;
         self.forward_ms = 0.0;
@@ -319,6 +337,11 @@ impl LanguageModel for Qwen35 {
         }
         rows.sort_unstable();
         rows.dedup();
+        if self.speculation_window() > 0 {
+            rows.extend(1..=self.speculation_window() + 1);
+            rows.sort_unstable();
+            rows.dedup();
+        }
         for backend in self.backends.iter().chain(self.head.backend()) {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
@@ -326,6 +349,9 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.work.recurrent.prepare(&rows)?;
+        if let Some(draft) = &self.dflash {
+            draft.prepare(&rows, self.options.speculation.window())?;
+        }
         self.loader.store.release_pages()?;
         Ok(())
     }
@@ -370,6 +396,10 @@ impl LanguageModel for Qwen35 {
             return Ok(());
         }
         ensure!(
+            self.dflash.is_none(),
+            "MTP and DFlash cannot be enabled together"
+        );
+        ensure!(
             (1..=7).contains(&max_draft) && max_draft < self.options.chunk,
             "MTP draft length must be 1..7 and smaller than ubatch"
         );
@@ -391,13 +421,17 @@ impl LanguageModel for Qwen35 {
         Ok(())
     }
     fn speculation_window(&self) -> usize {
-        self.mtp.as_ref().map_or(0, |m| m.max_draft)
+        if self.dflash.is_some() {
+            self.options.speculation.window()
+        } else {
+            self.mtp.as_ref().map_or(0, |m| m.max_draft)
+        }
     }
     fn speculation_p_min(&self) -> f64 {
-        self.options.mtp_p_min
+        self.options.speculation.p_min
     }
     fn speculation_sampling(&self) -> crate::sampling::DraftSampling {
-        self.options.mtp_sampling
+        self.options.speculation.sampling
     }
     fn draft_logits(&mut self, token: u32, cancel: &AtomicBool) -> Result<&[f32]> {
         ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
@@ -416,6 +450,14 @@ impl LanguageModel for Qwen35 {
         self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
         self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
         Ok(&self.logits)
+    }
+    fn draft_block_logits(
+        &mut self,
+        anchor: u32,
+        drafts: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<f32>>> {
+        self.dflash_logits(anchor, drafts, cancel)
     }
     fn verify_tokens(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
         Qwen35::verify_tokens(self, tokens, cancel)

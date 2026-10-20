@@ -7,6 +7,9 @@ impl Qwen35 {
         if let Some(mtp) = &self.mtp {
             backends.push(mtp.backend.clone());
         }
+        if let Some(draft) = &self.dflash {
+            backends.extend_from_slice(draft.backends());
+        }
         let mut result = crate::model::metrics::backend_stats(&backends, self.head.backend());
         let mut state_bytes = 0;
         let mut verification_state_bytes = 0;
@@ -50,12 +53,14 @@ impl Qwen35 {
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
         let speculative = json!({
-            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some(),
+            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some() || self.dflash.is_some(),
             "mtp_draft_tokens":self.mtp.as_ref().map_or(0,|m|m.max_draft),
-            "spec_draft_n_max":self.mtp.as_ref().map_or(0,|m|m.max_draft),
-            "spec_type":if self.mtp.is_some() {"draft-mtp"} else {"none"},
-            "spec_draft_p_min":self.options.mtp_p_min,"spec_draft_keep_low_confidence":false,
-            "spec_draft_sampling":self.options.mtp_sampling.as_str(),"spec_draft_confidence_top_k":10,
+            "spec_draft_n_max":crate::model::LanguageModel::speculation_window(self),
+            "spec_type":if self.dflash.is_some() {"draft-dflash"} else if self.mtp.is_some() {"draft-mtp"} else {"none"},
+            "spec_draft_model":self.options.speculation.model,
+            "dflash":self.dflash.as_ref().map(|d|d.stats()),
+            "spec_draft_p_min":self.options.speculation.p_min,"spec_draft_keep_low_confidence":false,
+            "spec_draft_sampling":self.options.speculation.sampling.as_str(),"spec_draft_confidence_top_k":10,
             "mtp_decoder_ms":self.mtp.as_ref().map_or(0.,|m|m.elapsed_ms),
         });
         result

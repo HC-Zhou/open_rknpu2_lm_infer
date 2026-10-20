@@ -85,8 +85,24 @@ pub fn run_round_with_options(
         let mut draft_attempts = 0;
         let mut confidence_stopped = false;
         let start = Instant::now();
-        for _ in 0..plan.draft_tokens() {
-            let logits = model.draft_logits(*inputs.last().unwrap(), cancel)?;
+        let block = if plan.draft_tokens() > 0 {
+            model.draft_block_logits(anchor, plan.draft_tokens(), cancel)?
+        } else {
+            None
+        };
+        let vocab = model.info().vocab_size;
+        ensure!(
+            block
+                .as_ref()
+                .is_none_or(|values| values.len() == plan.draft_tokens() * vocab),
+            "incorrect parallel draft logits shape"
+        );
+        for row in 0..plan.draft_tokens() {
+            let logits = if let Some(values) = &block {
+                &values[row * vocab..(row + 1) * vocab]
+            } else {
+                model.draft_logits(*inputs.last().unwrap(), cancel)?
+            };
             draft_attempts += 1;
             // The stopping decision is made before sampling, independently of
             // the proposed token. q remains the true processed distribution.

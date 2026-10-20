@@ -16,6 +16,7 @@ struct Model {
     p_min: f64,
     sampling: crate::sampling::DraftSampling,
     target_gap: f32,
+    parallel: bool,
 }
 impl Model {
     fn new(window: usize, reject_at: usize, eos_after: usize) -> Self {
@@ -39,6 +40,7 @@ impl Model {
             p_min: 0.,
             sampling: Default::default(),
             target_gap: 20.,
+            parallel: false,
         }
     }
     fn row(&self, position: usize) -> Vec<f32> {
@@ -98,6 +100,21 @@ impl LanguageModel for Model {
         }
         self.draft_step += 1;
         Ok(&self.logits)
+    }
+    fn draft_block_logits(
+        &mut self,
+        anchor: u32,
+        drafts: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<f32>>> {
+        if !self.parallel {
+            return Ok(None);
+        }
+        let mut logits = Vec::new();
+        for _ in 0..drafts {
+            logits.extend_from_slice(self.draft_logits(anchor, cancel)?);
+        }
+        Ok(Some(logits))
     }
     fn verify_tokens(&mut self, tokens: &[u32], _: &AtomicBool) -> Result<&[f32]> {
         ensure!(self.pending.is_none(), "duplicate transaction");
@@ -262,6 +279,30 @@ fn configured_confidence_truncation_reaches_generation_and_statistics() -> Resul
     assert!(
         actual.timings["mtp_accepted"].as_u64() < actual.timings["mtp_draft_attempts"].as_u64()
     );
+    Ok(())
+}
+
+#[test]
+fn parallel_drafter_preserves_stream_stop_budget_and_rejection_boundaries() -> Result<()> {
+    let (_dir, codec) = codec()?;
+    for window in [1, 3, 7] {
+        for reject_at in 0..=window {
+            for maximum in [1, 2, 8, 17] {
+                for stop in [vec![], vec!["BC".into()]] {
+                    let (baseline, baseline_stream) =
+                        run(&mut Model::new(0, 0, 12), &codec, maximum, stop.clone())?;
+                    let mut model = Model::new(window, reject_at, 12);
+                    model.parallel = true;
+                    let (actual, stream) = run(&mut model, &codec, maximum, stop)?;
+                    assert_eq!(actual.text, baseline.text);
+                    assert_eq!(stream, baseline_stream);
+                    assert_eq!(actual.completion_tokens, baseline.completion_tokens);
+                    assert_eq!(actual.finish_reason, baseline.finish_reason);
+                    assert!(model.pending.is_none());
+                }
+            }
+        }
+    }
     Ok(())
 }
 

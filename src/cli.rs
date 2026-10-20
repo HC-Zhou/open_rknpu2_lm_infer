@@ -1,7 +1,7 @@
 mod tune;
 use crate::{
     engine::{Engine, GenerationEvent, GenerationRequest, Prompt},
-    model::{ModelOptions, VisionDtype},
+    model::{ModelOptions, SpeculativeConfig, SpeculativeType, VisionDtype},
     sampling::{DraftSampling, SamplingParams},
     text::TextCodec,
 };
@@ -79,14 +79,21 @@ pub struct ModelArgs {
         global = true,
         value_enum,
         default_value = "none",
-        help = "Speculative decoding type; draft-mtp requires a Qwen3.5 MTP checkpoint"
+        help = "Qwen3.5 speculative decoding: none, draft-mtp or draft-dflash"
     )]
     pub spec_type: SpeculativeType,
     #[arg(
         long,
+        visible_alias = "model-draft",
+        global = true,
+        help = "DFlash safetensors draft model directory; also accepts -md"
+    )]
+    pub spec_draft_model: Option<PathBuf>,
+    #[arg(
+        long,
         global = true,
         default_value_t = 3,
-        help = "Maximum MTP draft tokens (0..7), smaller than ubatch-size; 0 disables"
+        help = "Maximum proposals (0..7); DFlash 3/7 corresponds to block 4/8; 0 disables"
     )]
     pub spec_draft_n_max: usize,
     #[arg(
@@ -99,11 +106,6 @@ pub struct ModelArgs {
     pub spec_draft_p_min: f64,
     #[arg(long, global = true, value_enum, default_value = "greedy")]
     pub spec_draft_sampling: DraftSampling,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SpeculativeType {
-    None,
-    DraftMtp,
 }
 fn parse_u64(s: &str) -> std::result::Result<u64, String> {
     if let Some(s) = s.strip_prefix("0x") {
@@ -120,16 +122,19 @@ impl ModelArgs {
     fn validate_command(&self, command: &Command) -> Result<()> {
         if self.spec_type == SpeculativeType::DraftMtp
             && self.spec_draft_n_max > 0
+            && matches!(command, Command::Tune { .. })
+        {
+            bail!("use --spec-type none for MTP target tuning");
+        }
+        if self.spec_type != SpeculativeType::None
+            && self.spec_draft_n_max > 0
             && matches!(
                 command,
-                Command::Bench(_)
-                    | Command::Eval { .. }
-                    | Command::Ppl { .. }
-                    | Command::Tune { .. }
+                Command::Bench(_) | Command::Eval { .. } | Command::Ppl { .. }
             )
         {
             bail!(
-                "MTP generation applies to run, chat and serve; use --spec-type none for fixed-token evaluation and tuning"
+                "speculative decoding applies to run, chat and serve; use --spec-type none for fixed-token evaluation"
             );
         }
         Ok(())
@@ -169,15 +174,15 @@ impl ModelArgs {
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,
-            mtp_draft: if self.spec_type == SpeculativeType::DraftMtp {
-                self.spec_draft_n_max
-            } else {
-                0
+            speculation: SpeculativeConfig {
+                kind: self.spec_type,
+                model: self.spec_draft_model.clone(),
+                max_draft: self.spec_draft_n_max,
+                p_min: self.spec_draft_p_min,
+                sampling: self.spec_draft_sampling,
             },
-            mtp_p_min: self.spec_draft_p_min,
-            mtp_sampling: self.spec_draft_sampling,
         };
-        options.validate_mtp()?;
+        options.validate_speculation()?;
         Ok(options)
     }
 }
@@ -384,6 +389,8 @@ fn llama_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ff
                 "--conversation".into()
             } else if !positional && arg == "-sys" {
                 "--system-prompt".into()
+            } else if !positional && arg == "-md" {
+                "--spec-draft-model".into()
             } else {
                 arg
             }
@@ -628,14 +635,85 @@ mod tests {
     }
 
     #[test]
+    fn dflash_model_aliases_and_block_lengths_use_the_shared_speculative_options() {
+        for flag in ["--spec-draft-model", "--model-draft", "-md"] {
+            for maximum in ["3", "7"] {
+                let cli = parse(&[
+                    "infer",
+                    "-m",
+                    "target",
+                    "run",
+                    "--spec-type",
+                    "draft-dflash",
+                    flag,
+                    "draft",
+                    "--spec-draft-n-max",
+                    maximum,
+                ]);
+                let options = cli.model.options().unwrap();
+                assert_eq!(options.speculation.kind, SpeculativeType::DraftDflash);
+                assert_eq!(options.speculation.model, Some(PathBuf::from("draft")));
+                assert_eq!(
+                    options.speculation.window(),
+                    maximum.parse::<usize>().unwrap()
+                );
+                cli.model.validate_command(&cli.command).unwrap();
+            }
+        }
+        let missing = parse(&[
+            "infer",
+            "-m",
+            "target",
+            "run",
+            "--spec-type",
+            "draft-dflash",
+        ]);
+        assert!(missing.model.options().is_err());
+        let disabled = parse(&[
+            "infer",
+            "-m",
+            "target",
+            "run",
+            "--spec-type",
+            "draft-dflash",
+            "--spec-draft-n-max",
+            "0",
+        ]);
+        assert_eq!(disabled.model.options().unwrap().speculation.window(), 0);
+        let wrong = parse(&[
+            "infer",
+            "-m",
+            "target",
+            "run",
+            "--spec-type",
+            "draft-mtp",
+            "-md",
+            "draft",
+        ]);
+        assert!(wrong.model.options().is_err());
+        let tune = parse(&[
+            "infer",
+            "-m",
+            "target",
+            "tune",
+            "--spec-type",
+            "draft-dflash",
+            "-md",
+            "draft",
+        ]);
+        tune.model.options().unwrap();
+        tune.model.validate_command(&tune.command).unwrap();
+    }
+
+    #[test]
     fn mtp_options_validate_before_loading_a_checkpoint() {
         let cli = parse(&["infer", "-m", "model", "run"]);
         assert_eq!(cli.model.spec_type, SpeculativeType::None);
         assert_eq!(cli.model.spec_draft_n_max, 3);
         assert_eq!(cli.model.spec_draft_sampling, DraftSampling::Greedy);
         let options = cli.model.options().unwrap();
-        assert_eq!(options.mtp_draft, 0);
-        assert_eq!(options.mtp_p_min, 0.);
+        assert_eq!(options.speculation.window(), 0);
+        assert_eq!(options.speculation.p_min, 0.);
         let disabled = parse(&[
             "infer",
             "-m",
@@ -646,7 +724,7 @@ mod tests {
             "--spec-draft-n-max",
             "0",
         ]);
-        assert_eq!(disabled.model.options().unwrap().mtp_draft, 0);
+        assert_eq!(disabled.model.options().unwrap().speculation.window(), 0);
         let alias = parse(&[
             "infer",
             "-m",
@@ -659,9 +737,9 @@ mod tests {
             "--spec-draft-sampling",
             "probabilistic",
         ]);
-        assert_eq!(alias.model.options().unwrap().mtp_p_min, 0.5);
+        assert_eq!(alias.model.options().unwrap().speculation.p_min, 0.5);
         assert_eq!(
-            alias.model.options().unwrap().mtp_sampling,
+            alias.model.options().unwrap().speculation.sampling,
             DraftSampling::Probabilistic
         );
         for command in ["run", "chat", "serve"] {
@@ -679,8 +757,8 @@ mod tests {
             ]);
             cli.model.validate_command(&cli.command).unwrap();
             let options = cli.model.options().unwrap();
-            assert_eq!(options.mtp_draft, 3);
-            assert_eq!(options.mtp_p_min, 0.75);
+            assert_eq!(options.speculation.window(), 3);
+            assert_eq!(options.speculation.p_min, 0.75);
         }
         for flags in [
             vec!["--spec-type", "draft-mtp", "--spec-draft-n-max", "8"],

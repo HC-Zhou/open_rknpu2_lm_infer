@@ -48,9 +48,7 @@ fn official_fp32_mtp_and_coordinate_adapter() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
-        mtp_draft: 0,
-        mtp_p_min: 0.,
-        mtp_sampling: Default::default(),
+        speculation: Default::default(),
     };
     crate::npu::configure_cpu(&mut options)?;
     let store = TensorStore::open(&options.path)?;

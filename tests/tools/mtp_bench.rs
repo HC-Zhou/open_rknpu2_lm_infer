@@ -208,9 +208,13 @@ fn main() -> Result<()> {
         tune_cache: args.tune_cache.unwrap_or_default(),
         attention_tile: 512,
         vision_dtype: Default::default(),
-        mtp_draft: schedule[0],
-        mtp_p_min: 0.,
-        mtp_sampling: Default::default(),
+        speculation: open_rknpu2_lm_infer::model::SpeculativeConfig {
+            kind: open_rknpu2_lm_infer::model::SpeculativeType::DraftMtp,
+            max_draft: schedule[0],
+            p_min: 0.,
+            sampling: Default::default(),
+            ..Default::default()
+        },
     })?;
     let params = SamplingParams {
         temperature: args.temperature,

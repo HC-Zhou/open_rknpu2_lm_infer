@@ -5,10 +5,13 @@ use std::path::PathBuf;
 pub mod checkpoint;
 pub(crate) mod cpu;
 pub mod dense;
+pub mod dflash;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
 pub(crate) mod projection;
+mod speculation;
+pub use speculation::{SpeculativeConfig, SpeculativeType};
 pub mod qwen35;
 pub(crate) mod trace;
 
@@ -42,26 +45,11 @@ pub struct ModelOptions {
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
-    pub mtp_draft: usize,
-    pub mtp_p_min: f64,
-    pub mtp_sampling: crate::sampling::DraftSampling,
+    pub speculation: SpeculativeConfig,
 }
 impl ModelOptions {
-    pub(crate) fn validate_mtp(&self) -> Result<()> {
-        anyhow::ensure!(self.mtp_draft <= 7, "spec-draft-n-max must be in 0..7");
-        anyhow::ensure!(
-            self.mtp_draft == 0 || self.mtp_draft < self.chunk,
-            "spec-draft-n-max must be smaller than ubatch-size"
-        );
-        anyhow::ensure!(
-            self.mtp_p_min.is_finite() && (0. ..=1.).contains(&self.mtp_p_min),
-            "spec-draft-p-min must be finite and in [0,1]"
-        );
-        anyhow::ensure!(
-            self.mtp_p_min == 0. || self.mtp_draft > 0,
-            "spec-draft-p-min requires --spec-type draft-mtp and spec-draft-n-max greater than zero"
-        );
-        Ok(())
+    pub(crate) fn validate_speculation(&self) -> Result<()> {
+        self.speculation.validate(self.chunk)
     }
 }
 
@@ -141,6 +129,16 @@ pub trait LanguageModel {
     ) -> Result<&[f32]> {
         anyhow::bail!("this model does not support MTP")
     }
+    /// Parallel drafter logits in proposal order. Sequential drafters return
+    /// None and are driven through draft_logits with each sampled predecessor.
+    fn draft_block_logits(
+        &mut self,
+        _anchor: u32,
+        _drafts: usize,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Vec<f32>>> {
+        Ok(None)
+    }
     fn verify_tokens(
         &mut self,
         _tokens: &[u32],
@@ -177,17 +175,17 @@ pub trait LanguageModel {
 }
 
 pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
-    options.validate_mtp()?;
-    let mtp_draft = options.mtp_draft;
+    options.validate_speculation()?;
+    let spec = options.speculation.clone();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     anyhow::ensure!(
-        mtp_draft == 0
+        spec.window() == 0
             || matches!(
                 config["model_type"].as_str(),
                 Some("qwen3_5" | "qwen3_5_text")
             ),
-        "MTP is supported only for Qwen3.5 checkpoints"
+        "speculative decoding is supported only for Qwen3.5 checkpoints"
     );
     crate::npu::configure_cpu(&mut options)?;
     let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
@@ -197,8 +195,8 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
             "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text"
         ),
     };
-    if mtp_draft > 0 {
-        model.enable_mtp(mtp_draft)?;
+    if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {
+        model.enable_mtp(spec.window())?;
     }
     Ok(model)
 }

@@ -451,9 +451,18 @@ impl Backend {
     }
     /// Full self attention, with a separate backend workspace from causal KV.
     pub fn noncausal_attention(&self, heads: usize, dimension: usize) -> Result<Attention> {
+        self.noncausal_gqa(heads, heads, dimension)
+    }
+    /// Bidirectional grouped-query attention for block diffusion drafting.
+    pub fn noncausal_gqa(
+        &self,
+        query_heads: usize,
+        kv_heads: usize,
+        dimension: usize,
+    ) -> Result<Attention> {
         self.attention_masked(
-            heads,
-            heads,
+            query_heads,
+            kv_heads,
             dimension,
             (dimension as f32).sqrt().recip(),
             true,
@@ -1037,9 +1046,7 @@ mod tests {
             tune_cache: cache.into(),
             attention_tile: 256,
             vision_dtype: Default::default(),
-            mtp_draft: 0,
-            mtp_p_min: 0.,
-            mtp_sampling: Default::default(),
+            speculation: Default::default(),
         };
         configure_cpu(&mut options)?;
         Ok(options)

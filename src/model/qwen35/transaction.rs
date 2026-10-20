@@ -117,6 +117,8 @@ impl Qwen35 {
             }
             self.position += consumed;
             self.next_rope_position += consumed;
+            self.features.commit(consumed);
+            self.flush_features(None)?;
             let vocab = self.info.vocab_size;
             self.logits
                 .copy_within((consumed - 1) * vocab..consumed * vocab, 0);
@@ -132,9 +134,13 @@ impl Qwen35 {
 
     pub fn abort_verification(&mut self) -> Result<()> {
         let verified = self.round.take().is_some();
+        self.features.abort();
         let result = (|| -> Result<()> {
             if let Some(mtp) = &mut self.mtp {
                 mtp.abort()?;
+            }
+            if let Some(draft) = &self.dflash {
+                draft.abort()?;
             }
             if !verified {
                 return Ok(());

@@ -45,6 +45,11 @@ path = "tests/tools/mtp_bench.rs"
 test = false
 
 [[example]]
+name = "dflash_bench"
+path = "tests/tools/dflash_bench.rs"
+test = false
+
+[[example]]
 name = "vision_probe"
 path = "tests/tools/vision_probe.rs"
 test = false

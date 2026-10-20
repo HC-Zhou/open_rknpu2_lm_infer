@@ -2,6 +2,7 @@
 mod attention;
 pub mod config;
 mod decoder;
+mod features;
 mod head;
 mod load;
 mod mtp;
