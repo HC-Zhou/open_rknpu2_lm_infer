@@ -9,3 +9,5 @@ Rust dependencies are pinned in Cargo.lock. Their upstream license and copyright
 The CPU kernels preserve arithmetic from the adjacent native inference demo and the open operator library. Model checkpoints and tokenizer assets are supplied separately under their own licenses. Model weights, vendor runtime binaries and reference documents are excluded from this source distribution.
 
 The Qwen3.5 C++ CPU module in `native/cpu_kernels/` adapts the gated delta loop and NEON helpers from llama.cpp / ggml. The Rust vector SiLU also adapts ggml arithmetic. Their MIT copyright and permission notice is retained in [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md) and must accompany distributions of this code.
+
+The DFlash adapter retains the Z Lab MIT notice in `src/model/dflash/LICENSE` and [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md), which accompanies binary distributions.

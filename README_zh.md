@@ -22,7 +22,7 @@
 
 ## 性能
 
-### Qwen3.5-4B 
+### Qwen3.5-4B
 
 | 测试 | rknn-llm 1.3.1 | open_rknpu2_lm_infer (MTP1) | 性能提升 |
 |---|---:|---:|---:|
