@@ -220,7 +220,7 @@ def run_case(case, profile, common, send, save, raw_log=None):
         'description': 'Capture exact supplied values in a simulated test. Never control real equipment.',
         'parameters': {'type': 'object', 'additionalProperties': True}}}
         for name in dict.fromkeys([name for name, _ in expected] + (['record'] if case['feedback'] == 'chain' else []))]
-    payload = {**common, 'stream': False, 'tool_choice': 'auto', 'tools': tools,
+    payload = {**common, 'stream': common.get('stream', False), 'tool_choice': 'auto', 'tools': tools,
                'messages': [{'role': 'user', 'content': prompt(expected, profile)}]}
     row = {'case': case['case'], 'category': case['category'], 'round': case['round'],
            'feedback_required': case['feedback'] is not None, 'tool_phases': []}
@@ -297,6 +297,7 @@ def main():
     parser.add_argument('--base-url', default='http://192.168.10.119:18084/v1')
     parser.add_argument('--api-key', default=os.environ.get('OPEN_RKNPU_API_KEY', ''))
     parser.add_argument('--profile', choices=['original', 'cdata_explicit'], required=True)
+    parser.add_argument('--stream', action='store_true', help='Use SSE; preserve raw events and score reassembled calls')
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--raw-log', type=Path)
@@ -307,7 +308,7 @@ def main():
     if args.rounds < 1:
         parser.error('--rounds must be positive')
     report = {'evidence': 'prompt-guided RK3588 real inference, no tool execution, no automatic retry',
-        'profile': args.profile, 'rounds': args.rounds, 'target': '192.168.10.119', 'base_url': args.base_url,
+        'profile': args.profile, 'stream': args.stream, 'rounds': args.rounds, 'target': '192.168.10.119', 'base_url': args.base_url,
         'server_revision': args.server_revision, 'model_revision': 'board W8A8 checkpoint; upstream revision unrecorded',
         'template_sha256': hashlib.sha256(args.template_path.read_bytes()).hexdigest() if args.template_path else None,
         'sampling': {'temperature': 0.0, 'top_p': 1.0, 'max_tokens': 1024, 'enable_thinking': False},
@@ -328,7 +329,9 @@ def main():
             raise ValueError('model discovery failed')
         model = models['data'][0]['id']
         report['model'] = model
-        common = {'model': model, **report['sampling']}
+        common = {'model': model, 'stream': args.stream, **report['sampling']}
+        if args.stream:
+            common['stream_options'] = {'include_usage': True}
         def send(payload):
             return probe.http(args.base_url, args.api_key, '/chat/completions', args.timeout, payload)
         for round_index in range(args.rounds):

@@ -56,10 +56,19 @@ mod engine {
                 stats: serde_json::Value::Null,
             };
             let (sender, events) = tokio::sync::mpsc::channel(2);
-            sender
-                .try_send(GenerationEvent::Token(output.into()))
-                .unwrap();
-            sender.try_send(GenerationEvent::Finished(result)).unwrap();
+            let output = output.to_owned();
+            tokio::spawn(async move {
+                for c in output.chars() {
+                    if sender
+                        .send(GenerationEvent::Token(c.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = sender.send(GenerationEvent::Finished(result)).await;
+            });
             Ok(GenerationHandle {
                 events,
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -29,6 +29,26 @@ class StabilityTests(unittest.TestCase):
         self.assertTrue(result['api_shape_ok'])
         self.assertFalse(result['call_structure_ok'])
 
+    def test_stream_requests_and_feedback_keep_streaming_enabled(self):
+        case = next(c for c in suite.cases(0) if c['case'] == 'feedback_chain')
+        sent = []
+        def send(payload):
+            self.assertTrue(payload['stream'])
+            self.assertTrue(payload['stream_options']['include_usage'])
+            sent.append(payload)
+            if len(sent) == 1:
+                answer = reply(case['calls'], 1)
+            elif len(sent) == 2:
+                answer = reply([('record', {'job_id': case['calls'][0][1]['job_id'],
+                    'receipt': 'RECEIPT_0_feedback_chain_0_8191', 'status': 'accepted'})], 2)
+            else:
+                answer = {'choices': [{'finish_reason': 'stop', 'message': {'content': 'RECEIPT_0_feedback_chain_0_8191'}}]}
+            return 200, suite.probe.dumps(answer), answer
+        row = suite.run_case(case, 'cdata_explicit', {'model': 'mock', 'stream': True,
+            'stream_options': {'include_usage': True}}, send, lambda *args: None)
+        self.assertTrue(row['passed'])
+        self.assertEqual(len(sent), 3)
+
     def test_independent_xml_respects_cdata_and_literal_entities(self):
         for profile in ('original', 'cdata_explicit'):
             args = {'literal': '<param>&value', 'entity': '&lt;param&gt;', 'closing': ']]>',

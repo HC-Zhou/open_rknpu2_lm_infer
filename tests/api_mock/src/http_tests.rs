@@ -5,10 +5,14 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 async fn request(parser: ToolCallParser, stream: bool, choice: &str, output: &str) -> String {
-    let preserve = parser == ToolCallParser::Minicpm5 && !stream && choice != "none";
+    let preserve = parser == ToolCallParser::Minicpm5 && choice != "none";
     let body = json!({"model":"mock", "stream":stream, "tool_choice":choice,
         "messages":[{"role":"user","content":format!("{}\n{output}", if preserve { "preserve" } else { "default" })}],
         "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"additionalProperties":false}}}]});
+    let mut body = body;
+    if stream {
+        body["stream_options"] = json!({"include_usage":true});
+    }
     let response = api::router_with_parser(crate::engine::Engine, None, parser)
         .oneshot(
             Request::post("/v1/chat/completions")
@@ -56,7 +60,7 @@ async fn xml_response_does_not_validate_tool_name_or_schema() {
 }
 
 #[tokio::test]
-async fn selection_none_and_streaming_keep_existing_behavior() {
+async fn selection_and_none_apply_to_both_response_modes() {
     let xml = "<function name='f'><param name='x'>1</param></function>";
     let json_call = "<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":1}}</tool_call>";
     for protocol in [ToolCallParser::ToolCallJson, ToolCallParser::Minicpm5] {
@@ -76,10 +80,7 @@ async fn selection_none_and_streaming_keep_existing_behavior() {
                     assert_eq!(response["choices"][0]["message"]["content"], output);
                 }
                 let sse = request(protocol, true, choice, output).await;
-                assert_eq!(
-                    sse.contains("\"tool_calls\":["),
-                    choice == "auto" && output == json_call
-                );
+                assert_eq!(sse.contains("\"tool_calls\":["), expected);
                 assert!(sse.contains("data: [DONE]"));
             }
         }
@@ -141,5 +142,75 @@ async fn default_router_and_requests_without_tools_do_not_preserve_xml_tokens() 
                 assert_eq!(result["choices"][0]["text"], xml);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn xml_sse_preserves_values_fallback_reasoning_usage_and_finish() {
+    for output in [
+        "<think>reason</think>before<function name='f'><param name='x'><![CDATA[{\"a\":[1,true,null],\"s\":\"</function>&lt;北京\"}]]></param></function>between<function name='g'/>after",
+        "<function name='f'><param name='x'>1</param><param name='x'>2</param></function><function name='f'>",
+        "text<function",
+    ] {
+        let batch: Value =
+            serde_json::from_str(&request(ToolCallParser::Minicpm5, false, "auto", output).await)
+                .unwrap();
+        let sse = request(ToolCallParser::Minicpm5, true, "auto", output).await;
+        let chunks: Vec<Value> = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::new();
+        let mut finish = Value::Null;
+        for chunk in &chunks {
+            let choice = &chunk["choices"][0];
+            let delta = &choice["delta"];
+            if let Some(s) = delta["content"].as_str() {
+                content.push_str(s);
+            }
+            if let Some(s) = delta["reasoning_content"].as_str() {
+                reasoning.push_str(s);
+            }
+            if let Some(cs) = delta["tool_calls"].as_array() {
+                calls.extend(cs.clone());
+            }
+            if !choice["finish_reason"].is_null() {
+                finish = choice["finish_reason"].clone();
+            }
+        }
+        let expected = &batch["choices"][0];
+        assert_eq!(
+            content,
+            expected["message"]["content"].as_str().unwrap_or("")
+        );
+        assert_eq!(
+            reasoning,
+            expected["message"]["reasoning_content"]
+                .as_str()
+                .unwrap_or("")
+        );
+        assert_eq!(finish, expected["finish_reason"]);
+        let expected_calls = expected["message"]["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(calls.len(), expected_calls.len());
+        for (index, (actual, expected)) in calls.iter().zip(expected_calls).enumerate() {
+            assert_eq!(actual["index"], index);
+            assert_eq!(actual["function"], expected["function"]);
+            assert!(
+                actual["id"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("_call_{index}"))
+            );
+        }
+        assert_eq!(chunks.last().unwrap()["choices"], json!([]));
+        assert!(chunks.last().unwrap()["usage"].is_object());
+        assert_eq!(sse.matches("data: [DONE]").count(), 1);
     }
 }

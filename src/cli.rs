@@ -234,7 +234,7 @@ pub enum Command {
         port: u16,
         #[arg(long, env = "OPEN_RKNPU_API_KEY")]
         api_key: Option<String>,
-        /// Non-streaming tool output protocol; does not change the chat template.
+        /// Tool output protocol; does not change the chat template.
         #[arg(long, value_enum, default_value = "tool-call-json")]
         tool_call_parser: crate::api::ToolCallParser,
     },

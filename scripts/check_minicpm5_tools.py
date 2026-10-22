@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prompt-guided, non-streaming MiniCPM5 tool checks against the RK3588 server.
+"""Prompt-guided MiniCPM5 tool checks against the RK3588 server.
 
 No tools are executed. API shape and expected model values are scored separately;
 a successful API response alone cannot establish that the parser was lossless.
@@ -85,6 +85,60 @@ def score(response, expected):
         return {"api_shape_ok": False, "expected_values_ok": False, "error": str(error)}
 
 
+def assemble_sse(raw):
+    """Reassemble OpenAI deltas for scoring; preserve raw SSE separately as evidence."""
+    message = {'role': 'assistant', 'content': ''}
+    calls = {}
+    finish = None
+    usage = None
+    done = False
+    for event in raw.replace('\r\n', '\n').split('\n\n'):
+        data = '\n'.join(line[5:].lstrip(' ') for line in event.splitlines() if line.startswith('data:'))
+        if not data:
+            continue
+        if done:
+            raise ValueError('SSE event after DONE')
+        if data == '[DONE]':
+            done = True
+            continue
+        chunk = loads(data)
+        if 'error' in chunk:
+            raise ValueError('SSE server error: ' + dumps(chunk['error']))
+        if chunk.get('usage') is not None:
+            usage = chunk['usage']
+        for choice in chunk['choices']:
+            if choice['index'] != 0:
+                raise ValueError('unexpected SSE choice index')
+            delta = choice['delta']
+            for key in ['content', 'reasoning_content']:
+                if delta.get(key) is not None:
+                    message[key] = message.get(key, '') + delta[key]
+            for call in delta.get('tool_calls', []):
+                index = call['index']
+                if type(index) is not int or index < 0:
+                    raise ValueError('invalid SSE tool index')
+                target = calls.setdefault(index, {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                for key in ['id', 'type']:
+                    if key in call:
+                        if key == 'id':
+                            target[key] += call[key]
+                        else:
+                            target[key] = call[key]
+                for key in ['name', 'arguments']:
+                    target['function'][key] += call.get('function', {}).get(key, '')
+            if choice.get('finish_reason') is not None:
+                if finish is not None:
+                    raise ValueError('duplicate SSE finish')
+                finish = choice['finish_reason']
+    if not done or finish is None:
+        raise ValueError('incomplete SSE response')
+    if calls:
+        if sorted(calls) != list(range(len(calls))):
+            raise ValueError('non-contiguous SSE tool indices')
+        message['tool_calls'] = [calls[i] for i in sorted(calls)]
+    return {'choices': [{'message': message, 'finish_reason': finish}], 'usage': usage}
+
+
 def http(base, key, endpoint, timeout, payload=None):
     headers = {"Content-Type": "application/json"}
     if key:
@@ -94,6 +148,12 @@ def http(base, key, endpoint, timeout, payload=None):
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode()
+            if payload and payload.get('stream'):
+                try:
+                    parsed = assemble_sse(raw)
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    parsed = {'error': str(error)}
+                return response.status, raw, parsed
             return response.status, raw, loads(raw)
     except urllib.error.HTTPError as error:
         raw = error.read().decode(errors="replace")
@@ -113,6 +173,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.0)
     parser.add_argument('--top-p', type=float, default=1.0)
     parser.add_argument('--max-tokens', type=int, default=1024)
+    parser.add_argument('--stream', action='store_true', help='Request SSE and score reconstructed tool calls; raw SSE is saved')
     parser.add_argument('--thinking', action='store_true')
     parser.add_argument('--timeout', type=float, default=180)
     args = parser.parse_args()
@@ -128,7 +189,7 @@ def main():
         'template_sha256': hashlib.sha256(args.template_path.read_bytes()).hexdigest() if args.template_path else None,
         'sampling': {'temperature': args.temperature, 'top_p': args.top_p,
                      'max_tokens': args.max_tokens, 'enable_thinking': args.thinking},
-        'repetitions': args.repetitions, 'results': [], 'complete': False,
+        'stream': args.stream, 'repetitions': args.repetitions, 'results': [], 'complete': False,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
 
@@ -156,7 +217,9 @@ def main():
                     '\nOutput only the following MiniCPM5 XML format. Parameter bodies are JSON literals; '
                     'preserve JSON quotes for strings, including strings spelling numbers or null.\n' + example)
                 payload = {'model': args.model, 'messages': [{'role': 'user', 'content': prompt}],
-                    'tools': tools, 'tool_choice': 'auto', 'stream': False, **report['sampling']}
+                    'tools': tools, 'tool_choice': 'auto', 'stream': args.stream, **report['sampling']}
+                if args.stream:
+                    payload['stream_options'] = {'include_usage': True}
                 row = {'case': case, 'repetition': repetition, 'expected': expected, 'request': payload}
                 report['results'].append(row)
                 save()

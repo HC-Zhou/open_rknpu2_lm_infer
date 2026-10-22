@@ -14,7 +14,7 @@ impl ToolCallParser {
         match self {
             Self::ToolCallJson => "Tool call parser: tool-call-json (default JSON protocol)",
             Self::Minicpm5 => {
-                "Tool call parser: minicpm5 (non-streaming only; streaming retains tool-call-json)"
+                "Tool call parser: minicpm5 (XML; streaming emits complete function blocks)"
             }
         }
     }
@@ -130,29 +130,71 @@ fn parse_function(block: &str) -> Option<Value> {
     Some(json!({"name": name, "arguments": serde_json::to_string(&arguments).ok()?}))
 }
 
+/// Buffer only a possible function block or a partial opening marker. Calls are
+/// emitted atomically after validation so malformed XML can still become text.
+pub(super) struct MiniCpm5Stream {
+    pending: String,
+    pub(super) calls: usize,
+    response_id: String,
+}
+impl MiniCpm5Stream {
+    pub(super) fn new(response_id: String) -> Self {
+        Self {
+            pending: String::new(),
+            calls: 0,
+            response_id,
+        }
+    }
+    pub(super) fn push(&mut self, text: &str, flush: bool) -> Vec<Value> {
+        self.pending.push_str(text);
+        let mut out = Vec::new();
+        loop {
+            if let Some(start) = function_start(&self.pending) {
+                if start > 0 {
+                    out.push(json!({"content": &self.pending[..start]}));
+                    self.pending.drain(..start);
+                }
+                if let Some(end) = function_end(&self.pending) {
+                    if let Some(function) = parse_function(&self.pending[..end]) {
+                        out.push(json!({"tool_calls": [{"index": self.calls, "id": format!("{}_call_{}", self.response_id, self.calls), "type": "function", "function": function}]}));
+                        self.calls += 1;
+                    } else {
+                        out.push(json!({"content": &self.pending[..end]}));
+                    }
+                    self.pending.drain(..end);
+                    continue;
+                }
+                if flush {
+                    out.push(json!({"content": std::mem::take(&mut self.pending)}));
+                }
+                return out;
+            }
+            // Include the full '<function' prefix: it becomes a marker only
+            // after the following whitespace or '>' arrives.
+            let marker = "<function";
+            let hold = if flush {
+                0
+            } else {
+                (1..=marker.len().min(self.pending.len()))
+                    .rev()
+                    .find(|n| {
+                        self.pending.is_char_boundary(self.pending.len() - n)
+                            && marker.starts_with(&self.pending[self.pending.len() - n..])
+                    })
+                    .unwrap_or(0)
+            };
+            let end = self.pending.len() - hold;
+            if end > 0 {
+                out.push(json!({"content": &self.pending[..end]}));
+                self.pending.drain(..end);
+            }
+            return out;
+        }
+    }
+}
+
 pub(super) fn parse_minicpm5(text: &str, response_id: &str) -> Vec<Value> {
-    let mut rest = text;
-    let mut out = Vec::new();
-    let mut calls = 0;
-    while let Some(start) = function_start(rest) {
-        if start > 0 {
-            out.push(json!({"content": &rest[..start]}));
-        }
-        rest = &rest[start..];
-        let Some(end) = function_end(rest) else { break };
-        let block = &rest[..end];
-        if let Some(function) = parse_function(block) {
-            out.push(json!({"tool_calls": [{"index": calls, "id": format!("{response_id}_call_{calls}"), "type": "function", "function": function}]}));
-            calls += 1;
-        } else {
-            out.push(json!({"content": block}));
-        }
-        rest = &rest[end..];
-    }
-    if !rest.is_empty() {
-        out.push(json!({"content": rest}));
-    }
-    out
+    MiniCpm5Stream::new(response_id.to_owned()).push(text, true)
 }
 
 #[cfg(test)]
@@ -180,8 +222,76 @@ mod tests {
         assert!(
             ToolCallParser::Minicpm5
                 .startup_message()
-                .contains("non-streaming only")
+                .contains("streaming emits complete function blocks")
         );
+    }
+
+    #[test]
+    fn streaming_matches_batch_at_every_character_boundary() {
+        for input in [
+            "北京<function name='f'><param name='x'><![CDATA[{\"s\":\"</function>&lt;北京\",\"a\":[1,true,null]}]]></param></function>尾<function name='g'/>",
+            "<function name='f'><arguments><param name='x'>a&amp;b</param></arguments></function>",
+            "<function name='f'><param name='x'>1</param><param name='x'>2</param></function>tail",
+            "prefix<function name='f'><param name='x'><![CDATA[truncated</function>",
+            "<functionary>text</functionary><function",
+            "<function name='f'><function name='g'/></function><function name='ok'/>",
+        ] {
+            let expected = parse_minicpm5(input, "r");
+            // Coalesce content fragments; SSE chunk boundaries are arbitrary.
+            let normalize = |deltas: Vec<Value>| {
+                let mut text = String::new();
+                let mut calls = Vec::new();
+                for d in deltas {
+                    if let Some(s) = d["content"].as_str() {
+                        text.push_str(s);
+                    }
+                    if let Some(c) = d.get("tool_calls") {
+                        calls.push(c.clone());
+                    }
+                }
+                (text, calls)
+            };
+            for split in input.char_indices().map(|(i, _)| i).chain([input.len()]) {
+                let mut stream = MiniCpm5Stream::new("r".into());
+                let mut actual = stream.push(&input[..split], false);
+                actual.extend(stream.push(&input[split..], false));
+                actual.extend(stream.push("", true));
+                assert_eq!(
+                    normalize(actual),
+                    normalize(expected.clone()),
+                    "split {split}: {input}"
+                );
+            }
+            let mut stream = MiniCpm5Stream::new("r".into());
+            let mut actual = Vec::new();
+            for c in input.chars() {
+                actual.extend(stream.push(&c.to_string(), false));
+            }
+            actual.extend(stream.push("", true));
+            assert_eq!(normalize(actual), normalize(expected));
+        }
+    }
+
+    #[test]
+    fn streaming_emits_text_and_complete_calls_before_finish() {
+        let mut stream = MiniCpm5Stream::new("r".into());
+        assert_eq!(
+            stream.push("hello<fun", false),
+            vec![json!({"content":"hello"})]
+        );
+        assert!(
+            stream
+                .push("ction name='f'><param name='x'>", false)
+                .is_empty()
+        );
+        let deltas = stream.push("123</param></function><function", false);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"x\":123}"
+        );
+        assert_eq!(stream.calls, 1);
+        assert_eq!(stream.push("", true), vec![json!({"content":"<function"})]);
     }
 
     #[test]

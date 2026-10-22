@@ -58,6 +58,26 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(report['summary'], {'finished': 5, 'passed': 5})
             self.assertNotIn('api_key', report)
 
+    def test_sse_reassembles_fragmented_calls_and_usage(self):
+        chunks = [
+            {'choices': [{'index': 0, 'delta': {'content': 'before', 'tool_calls': [
+                {'index': 0, 'id': 'call_0', 'type': 'function', 'function': {'name': 'f', 'arguments': '{"x":'}}]}, 'finish_reason': None}]},
+            {'choices': [{'index': 0, 'delta': {'tool_calls': [
+                {'index': 0, 'function': {'arguments': '123}'}},
+                {'index': 1, 'id': 'call_1', 'type': 'function', 'function': {'name': 'g', 'arguments': '{}'}}]}, 'finish_reason': None}]},
+            {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]},
+            {'choices': [], 'usage': {'total_tokens': 5}},
+        ]
+        raw = ''.join('data: ' + probe.dumps(chunk) + '\r\n\r\n' for chunk in chunks) + 'data: [DONE]\r\n\r\n'
+        answer = probe.assemble_sse(raw)
+        self.assertTrue(probe.score(answer, [('f', {'x': 123}), ('g', {})])['expected_values_ok'])
+        self.assertEqual(answer['choices'][0]['message']['content'], 'before')
+        self.assertEqual(answer['usage'], {'total_tokens': 5})
+        with self.assertRaises(ValueError):
+            probe.assemble_sse(raw.replace('data: [DONE]', ': not complete'))
+        with self.assertRaises(ValueError):
+            probe.assemble_sse('data: {"error":{"message":"failed"}}\n\ndata: [DONE]\n\n')
+
     def test_discovery_failure_is_saved(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'report.json'
