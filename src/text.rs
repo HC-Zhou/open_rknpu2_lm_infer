@@ -1,6 +1,9 @@
+#[path = "text/output_decoder.rs"]
+mod output_decoder;
 use crate::engine::Prompt;
 use anyhow::{Context, Result, anyhow, ensure};
 use minijinja::{Environment, context};
+pub(crate) use output_decoder::OutputDecoder;
 use serde_json::Value;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -11,6 +14,32 @@ pub struct TextCodec {
     eos_token: Value,
     bos_token: Value,
     images: Option<crate::vision::ImageProcessor>,
+}
+
+// Transformers templates can pass ensure_ascii to tojson. Delegate all existing
+// behavior (including indentation and HTML escaping) to MiniJinja unchanged.
+fn template_tojson(
+    value: &minijinja::Value,
+    indent: Option<minijinja::Value>,
+    args: minijinja::value::Kwargs,
+) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let ensure_ascii: Option<bool> = args.get("ensure_ascii")?;
+    let rendered = minijinja::filters::tojson(value, indent, args)?;
+    if ensure_ascii != Some(true) {
+        return Ok(rendered);
+    }
+    let mut ascii = String::new();
+    for ch in rendered.as_str().unwrap_or("").chars() {
+        if ch.is_ascii() {
+            ascii.push(ch);
+        } else {
+            use std::fmt::Write;
+            for unit in ch.encode_utf16(&mut [0; 2]) {
+                write!(ascii, "\\u{unit:04x}").unwrap();
+            }
+        }
+    }
+    Ok(minijinja::Value::from_safe_string(ascii))
 }
 
 impl TextCodec {
@@ -48,6 +77,7 @@ impl TextCodec {
             } => {
                 ensure!(!messages.is_empty(), "messages must not be empty");
                 let mut env = Environment::new();
+                env.add_filter("tojson", template_tojson);
                 env.set_trim_blocks(true);
                 env.set_lstrip_blocks(true);
                 env.set_unknown_method_callback(
@@ -165,6 +195,69 @@ impl StopFilter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tojson_supports_ascii_keyword_without_changing_existing_templates() {
+        let mut env = Environment::new();
+        env.add_filter("tojson", template_tojson);
+        let value = serde_json::json!({"text":"北京😀<&'", "items":[1,true]});
+        for template in [
+            "{{ v|tojson }}",
+            "{{ v|tojson(indent=2) }}",
+            "{{ v|tojson(2) }}",
+        ] {
+            let actual = env.render_str(template, context! { v => &value }).unwrap();
+            let expected = Environment::new()
+                .render_str(template, context! { v => &value })
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unicode = env
+            .render_str(
+                "{{ v|tojson(ensure_ascii=False) }}",
+                context! { v => &value },
+            )
+            .unwrap();
+        assert!(unicode.contains("北京😀"));
+        let ascii = env
+            .render_str(
+                "{{ v|tojson(indent=2, ensure_ascii=True) }}",
+                context! { v => &value },
+            )
+            .unwrap();
+        assert!(ascii.is_ascii());
+        assert!(ascii.contains("\\ud83d\\ude00"));
+        assert_eq!(serde_json::from_str::<Value>(&ascii).unwrap(), value);
+        assert!(
+            env.render_str("{{ v|tojson(unknown=True) }}", context! { v => &value })
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires MINICPM5_MODEL_PATH with the real template and tokenizer"]
+    fn real_minicpm5_template_renders_tools_and_history() {
+        let path = std::path::PathBuf::from(
+            std::env::var("MINICPM5_MODEL_PATH").expect("set MINICPM5_MODEL_PATH"),
+        );
+        let codec = TextCodec::load(&path).unwrap();
+        let rendered = codec.format(&Prompt::Chat {
+            messages: vec![
+                serde_json::json!({"role":"user","content":"查询北京天气"}),
+                serde_json::json!({"role":"assistant","content":"", "tool_calls":[{"id":"c0","type":"function","function":{"name":"capture", "arguments":{"city":"北京"}}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":"c0", "content":"晴"}),
+            ],
+            tools: Some(serde_json::json!([{"type":"function", "function":{"name":"capture", "description":"查询天气", "parameters":{"type":"object"}}}])),
+            enable_thinking: false,
+        }).unwrap();
+        assert!(rendered.contains("查询天气"));
+        assert!(
+            rendered.contains(
+                "<function name=\"capture\"><param name=\"city\">北京</param></function>"
+            )
+        );
+        assert!(rendered.contains("<tool_response>\n晴\n</tool_response>"));
+    }
+
     use super::*;
     #[test]
     fn native_template_tools_and_whitespace_rules() {

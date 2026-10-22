@@ -1,0 +1,266 @@
+//! Explicit output protocols. MiniCPM5 framing follows SGLang's MiniCPM5Detector;
+//! values are decoded from their JSON literals, without consulting tool schemas.
+use serde_json::{Map, Value, json};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ToolCallParser {
+    #[default]
+    ToolCallJson,
+    Minicpm5,
+}
+
+impl ToolCallParser {
+    pub fn startup_message(self) -> &'static str {
+        match self {
+            Self::ToolCallJson => "Tool call parser: tool-call-json (default JSON protocol)",
+            Self::Minicpm5 => {
+                "Tool call parser: minicpm5 (non-streaming only; streaming retains tool-call-json)"
+            }
+        }
+    }
+}
+
+fn function_start(text: &str) -> Option<usize> {
+    text.match_indices("<function").find_map(|(i, _)| {
+        text.as_bytes()
+            .get(i + 9)
+            .filter(|c| c.is_ascii_whitespace() || **c == b'>')
+            .map(|_| i)
+    })
+}
+
+// Find a complete outer function, ignoring closing-tag spellings inside CDATA,
+// comments and quoted attributes. Nested functions remain one invalid block.
+fn function_end(text: &str) -> Option<usize> {
+    let mut pos = 0;
+    let mut depth = 0usize;
+    while let Some(offset) = text[pos..].find('<') {
+        let start = pos + offset;
+        let rest = &text[start..];
+        if let Some(body) = rest.strip_prefix("<![CDATA[") {
+            pos = start + 9 + body.find("]]>")? + 3;
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix("<!--") {
+            pos = start + 4 + body.find("-->")? + 3;
+            continue;
+        }
+        let mut quote = None;
+        let end = rest.bytes().enumerate().find_map(|(i, c)| {
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+            } else if c == b'\'' || c == b'"' {
+                quote = Some(c);
+            } else if c == b'>' {
+                return Some(start + i + 1);
+            }
+            None
+        })?;
+        let tag = &text[start..end];
+        if tag.starts_with("</function") && tag[10..tag.len() - 1].trim().is_empty() {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(end);
+            }
+        } else if function_start(tag) == Some(0) {
+            depth += 1;
+            if tag.ends_with("/>") {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(end);
+                }
+            }
+        }
+        pos = end;
+    }
+    None
+}
+
+fn only_whitespace(node: roxmltree::Node<'_, '_>) -> bool {
+    node.is_text() && node.text().unwrap_or("").trim().is_empty()
+}
+
+fn parse_function(block: &str) -> Option<Value> {
+    // DTDs (including external entities) are disabled by roxmltree's defaults.
+    let doc = roxmltree::Document::parse(block).ok()?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "function"
+        || root.tag_name().namespace().is_some()
+        || root.attributes().len() != 1
+    {
+        return None;
+    }
+    let name = root.attribute("name").filter(|x| !x.trim().is_empty())?;
+    let children: Vec<_> = root.children().filter(|n| !only_whitespace(*n)).collect();
+    let params = if children.len() == 1 && children[0].has_tag_name("arguments") {
+        if children[0].attributes().len() != 0 {
+            return None;
+        }
+        children[0]
+            .children()
+            .filter(|n| !only_whitespace(*n))
+            .collect::<Vec<_>>()
+    } else {
+        children
+    };
+    let mut arguments = Map::new();
+    for param in params {
+        if !param.has_tag_name("param")
+            || param.tag_name().namespace().is_some()
+            || param.attributes().len() != 1
+        {
+            return None;
+        }
+        let key = param.attribute("name").filter(|x| !x.trim().is_empty())?;
+        if arguments.contains_key(key) {
+            return None;
+        }
+        let mut raw = String::new();
+        for child in param.children() {
+            if !child.is_text() {
+                return None;
+            }
+            raw.push_str(child.text().unwrap_or(""));
+        }
+        let value = serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw));
+        arguments.insert(key.to_owned(), value);
+    }
+    Some(json!({"name": name, "arguments": serde_json::to_string(&arguments).ok()?}))
+}
+
+pub(super) fn parse_minicpm5(text: &str, response_id: &str) -> Vec<Value> {
+    let mut rest = text;
+    let mut out = Vec::new();
+    let mut calls = 0;
+    while let Some(start) = function_start(rest) {
+        if start > 0 {
+            out.push(json!({"content": &rest[..start]}));
+        }
+        rest = &rest[start..];
+        let Some(end) = function_end(rest) else { break };
+        let block = &rest[..end];
+        if let Some(function) = parse_function(block) {
+            out.push(json!({"tool_calls": [{"index": calls, "id": format!("{response_id}_call_{calls}"), "type": "function", "function": function}]}));
+            calls += 1;
+        } else {
+            out.push(json!({"content": block}));
+        }
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        out.push(json!({"content": rest}));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Options {
+        #[arg(long, value_enum, default_value = "tool-call-json")]
+        tool_call_parser: ToolCallParser,
+    }
+
+    #[test]
+    fn explicit_selection_and_startup_message() {
+        assert_eq!(
+            Options::try_parse_from(["test"]).unwrap().tool_call_parser,
+            ToolCallParser::ToolCallJson
+        );
+        for value in ["minicpm5", "tool-call-json"] {
+            let options = Options::try_parse_from(["test", "--tool-call-parser", value]).unwrap();
+            assert!(options.tool_call_parser.startup_message().contains(value));
+        }
+        assert!(Options::try_parse_from(["test", "--tool-call-parser", "auto"]).is_err());
+        assert!(
+            ToolCallParser::Minicpm5
+                .startup_message()
+                .contains("non-streaming only")
+        );
+    }
+
+    #[test]
+    fn literal_types_and_strings_are_not_schema_coerced() {
+        let values = [
+            ("123", json!(123)),
+            ("1.25", json!(1.25)),
+            ("true", json!(true)),
+            ("false", json!(false)),
+            ("null", Value::Null),
+            ("\"123\"", json!("123")),
+            ("\"null\"", json!("null")),
+            ("[1,\"x\",null]", json!([1, "x", null])),
+            ("{\"k\":false}", json!({"k": false})),
+            ("{'bad': 1}", json!("{'bad': 1}")),
+            ("  北京\n ", json!("  北京\n ")),
+            ("", json!("")),
+            ("001", json!("001")),
+            ("NaN", json!("NaN")),
+            (
+                "123456789012345678901234567890",
+                serde_json::from_str("123456789012345678901234567890").unwrap(),
+            ),
+        ];
+        for (raw, expected) in values {
+            let block = format!(
+                "<function name=\"unknown\"><param name=\"extra\"><![CDATA[{raw}]]></param></function>"
+            );
+            let function = parse_function(&block).unwrap();
+            let args: Value =
+                serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args["extra"], expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn xml_entities_cdata_wrappers_and_multiple_calls() {
+        let input = "prefix<function name='f'><arguments><param name='x'>a&amp;b&lt;c</param></arguments></function>between<function name=\"g\"><param name=\"s\"><![CDATA[ </function><param>\n ]]></param></function>suffix";
+        let out = parse_minicpm5(input, "r");
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0]["content"], "prefix");
+        assert_eq!(out[2]["content"], "between");
+        assert_eq!(out[4]["content"], "suffix");
+        for (i, name, key, expected) in [
+            (1, "f", "x", "a&b<c"),
+            (3, "g", "s", " </function><param>\n "),
+        ] {
+            let call = &out[i]["tool_calls"][0];
+            assert_eq!(call["function"]["name"], name);
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args[key], expected);
+        }
+        assert_eq!(out[3]["tool_calls"][0]["index"], 1);
+        assert!(parse_function("<function name='f'/>").is_some());
+    }
+
+    #[test]
+    fn malformed_structures_are_preserved_verbatim() {
+        for text in [
+            "<function><param name='x'>1</param></function>",
+            "<function name='f'><param>1</param></function>",
+            "<function name='f'><param name='x'>1</param><param name='x'>2</param></function>",
+            "<function name='f'><param name='x'>a&b</param></function>",
+            "<function name='f'><param name='x'><nested/></param></function>",
+            "<function name='f'><function name='g'></function></function>",
+            "<function name='f'><param name='x'>1",
+            "<function name='f'><param name='x'><![CDATA[</function>",
+            "<function name='f'><other/></function>",
+            "<functionary>plain</functionary>",
+        ] {
+            let out = parse_minicpm5(text, "r");
+            assert!(out.iter().all(|d| d.get("tool_calls").is_none()), "{text}");
+            assert_eq!(
+                out.iter()
+                    .filter_map(|d| d["content"].as_str())
+                    .collect::<String>(),
+                text
+            );
+        }
+    }
+}

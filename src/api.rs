@@ -2,7 +2,10 @@ use crate::engine::{
     Engine, GenerationEvent, GenerationHandle, GenerationRequest, GenerationResult, Prompt,
 };
 use crate::sampling::SamplingParams;
+#[path = "api/request.rs"]
 mod request;
+#[path = "api/tool_parser.rs"]
+mod tool_parser;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -24,14 +27,24 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub use tool_parser::ToolCallParser;
 
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+    tool_call_parser: ToolCallParser,
     api_key: Option<Arc<str>>,
 }
 
 pub fn router(engine: Engine, api_key: Option<String>) -> Router {
+    router_with_parser(engine, api_key, ToolCallParser::default())
+}
+
+pub fn router_with_parser(
+    engine: Engine,
+    api_key: Option<String>,
+    tool_call_parser: ToolCallParser,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -41,6 +54,7 @@ pub fn router(engine: Engine, api_key: Option<String>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(24 * 1024 * 1024))
         .with_state(AppState {
             engine,
+            tool_call_parser,
             api_key: api_key.map(Arc::from),
         })
 }
@@ -51,15 +65,29 @@ pub async fn serve(
     port: u16,
     api_key: Option<String>,
 ) -> anyhow::Result<()> {
+    serve_with_parser(engine, host, port, api_key, ToolCallParser::default()).await
+}
+
+pub async fn serve_with_parser(
+    engine: Engine,
+    host: &str,
+    port: u16,
+    api_key: Option<String>,
+    tool_call_parser: ToolCallParser,
+) -> anyhow::Result<()> {
+    eprintln!("{}", tool_call_parser.startup_message());
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     eprintln!("OpenAI API listening on http://{}", listener.local_addr()?);
     let shutdown_engine = engine.clone();
-    axum::serve(listener, router(engine, api_key))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_engine.shutdown();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router_with_parser(engine, api_key, tool_call_parser),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_engine.shutdown();
+    })
+    .await?;
     Ok(())
 }
 
@@ -183,9 +211,13 @@ async fn respond(
             .engine
             .prompt_opens_thinking(&parsed.request.prompt)
             .map_err(generation_error)?;
+    let preserve_xml = chat
+        && !parsed.stream
+        && parsed.tools_enabled
+        && state.tool_call_parser == ToolCallParser::Minicpm5;
     let mut handle = state
         .engine
-        .generate(parsed.request)
+        .generate_with_tool_markers(parsed.request, preserve_xml)
         .map_err(generation_error)?;
     let id = response_id(chat);
     let timestamp = created();
@@ -214,7 +246,13 @@ async fn respond(
             }
             GenerationEvent::Finished(result) => {
                 let choice = if chat {
-                    chat_choice(&result, &id, parsed.tools_enabled, preopened_thinking)
+                    chat_choice_with_parser(
+                        &result,
+                        &id,
+                        parsed.tools_enabled,
+                        preopened_thinking,
+                        state.tool_call_parser,
+                    )
                 } else {
                     json!({"index":0,"text":result.text,"logprobs":null,"finish_reason":result.finish_reason})
                 };
@@ -322,17 +360,39 @@ impl ToolStream {
         }
     }
 }
+#[cfg(test)]
 fn chat_choice(
     result: &GenerationResult,
     id: &str,
     tools_enabled: bool,
     preopened_thinking: bool,
 ) -> Value {
+    chat_choice_with_parser(
+        result,
+        id,
+        tools_enabled,
+        preopened_thinking,
+        ToolCallParser::ToolCallJson,
+    )
+}
+
+fn chat_choice_with_parser(
+    result: &GenerationResult,
+    id: &str,
+    tools_enabled: bool,
+    preopened_thinking: bool,
+    protocol: ToolCallParser,
+) -> Value {
     let (text, reasoning) = split_thinking(&result.text, preopened_thinking);
     let mut parser = ToolStream::new(tools_enabled, id.to_owned());
     let mut content = String::new();
     let mut calls = vec![];
-    for delta in parser.push(text, true) {
+    let deltas = if tools_enabled && protocol == ToolCallParser::Minicpm5 {
+        tool_parser::parse_minicpm5(text, id)
+    } else {
+        parser.push(text, true)
+    };
+    for delta in deltas {
         if let Some(text) = delta["content"].as_str() {
             content.push_str(text);
         }
