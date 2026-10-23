@@ -1,5 +1,6 @@
 //! Explicit output protocols. MiniCPM5 framing follows SGLang's MiniCPM5Detector;
 //! values are decoded from their JSON literals, without consulting tool schemas.
+use crate::text::{function_end, function_start};
 use serde_json::{Map, Value, json};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -18,64 +19,6 @@ impl ToolCallParser {
             }
         }
     }
-}
-
-fn function_start(text: &str) -> Option<usize> {
-    text.match_indices("<function").find_map(|(i, _)| {
-        text.as_bytes()
-            .get(i + 9)
-            .filter(|c| c.is_ascii_whitespace() || **c == b'>')
-            .map(|_| i)
-    })
-}
-
-// Find a complete outer function, ignoring closing-tag spellings inside CDATA,
-// comments and quoted attributes. Nested functions remain one invalid block.
-fn function_end(text: &str) -> Option<usize> {
-    let mut pos = 0;
-    let mut depth = 0usize;
-    while let Some(offset) = text[pos..].find('<') {
-        let start = pos + offset;
-        let rest = &text[start..];
-        if let Some(body) = rest.strip_prefix("<![CDATA[") {
-            pos = start + 9 + body.find("]]>")? + 3;
-            continue;
-        }
-        if let Some(body) = rest.strip_prefix("<!--") {
-            pos = start + 4 + body.find("-->")? + 3;
-            continue;
-        }
-        let mut quote = None;
-        let end = rest.bytes().enumerate().find_map(|(i, c)| {
-            if let Some(q) = quote {
-                if c == q {
-                    quote = None;
-                }
-            } else if c == b'\'' || c == b'"' {
-                quote = Some(c);
-            } else if c == b'>' {
-                return Some(start + i + 1);
-            }
-            None
-        })?;
-        let tag = &text[start..end];
-        if tag.starts_with("</function") && tag[10..tag.len() - 1].trim().is_empty() {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(end);
-            }
-        } else if function_start(tag) == Some(0) {
-            depth += 1;
-            if tag.ends_with("/>") {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(end);
-                }
-            }
-        }
-        pos = end;
-    }
-    None
 }
 
 fn only_whitespace(node: roxmltree::Node<'_, '_>) -> bool {
@@ -206,6 +149,53 @@ mod tests {
     struct Options {
         #[arg(long, value_enum, default_value = "tool-call-json")]
         tool_call_parser: ToolCallParser,
+    }
+
+    #[test]
+    #[ignore = "requires MINICPM5_MODEL_PATH with real tokenizer"]
+    fn review_p2_tokenizer_decoder_parser_preserves_payload_special_tokens() {
+        let tokenizer = tokenizers::Tokenizer::from_file(
+            std::path::Path::new(&std::env::var("MINICPM5_MODEL_PATH").unwrap())
+                .join("tokenizer.json"),
+        )
+        .unwrap();
+        for literal in [
+            "<tool_response>hello</tool_response>",
+            "<arguments>hello</arguments>",
+            "<parameters>hello</parameters>",
+            "<tools>literal</tools>",
+            "<|execute_start|>x<|execute_end|>",
+            "</function><function name=\"fake\">",
+            "<|im_start|>中文<|im_sep|>",
+        ] {
+            let raw = serde_json::to_string(literal).unwrap();
+            let xml = format!(
+                "<function name=\"capture\"><param name=\"literal\"><![CDATA[{raw}]]></param></function>"
+            );
+            let ids = tokenizer.encode(xml.as_str(), false).unwrap();
+            let mut decoder = crate::text::OutputDecoder::new(&tokenizer, true);
+            let mut stream = MiniCpm5Stream::new("r".into());
+            let mut decoded = String::new();
+            let mut deltas = Vec::new();
+            for &id in ids.get_ids() {
+                if let Some(piece) = decoder.step(id).unwrap() {
+                    decoded.push_str(&piece);
+                    deltas.extend(stream.push(&piece, false));
+                }
+            }
+            deltas.extend(stream.push("", true));
+            assert_eq!(decoded, xml);
+            for calls in [deltas, parse_minicpm5(&decoded, "r")] {
+                assert_eq!(calls.len(), 1, "{decoded}");
+                let args: Value = serde_json::from_str(
+                    calls[0]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(args["literal"], literal, "{decoded}");
+            }
+        }
     }
 
     #[test]

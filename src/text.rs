@@ -1,5 +1,7 @@
 #[path = "text/output_decoder.rs"]
 mod output_decoder;
+#[path = "text/tool_framing.rs"]
+mod tool_framing;
 use crate::engine::Prompt;
 use anyhow::{Context, Result, anyhow, ensure};
 use minijinja::{Environment, context};
@@ -7,6 +9,7 @@ pub(crate) use output_decoder::OutputDecoder;
 use serde_json::Value;
 use std::path::Path;
 use tokenizers::Tokenizer;
+pub(crate) use tool_framing::{function_end, function_start};
 
 pub struct TextCodec {
     pub tokenizer: Tokenizer,
